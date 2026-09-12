@@ -5,6 +5,9 @@
 (() => {
   'use strict';
 
+  // Note: test-related polyfills were removed. Tests should provide real File
+  // objects or use DataTransfer to set input.files.
+
   const DEFAULT_AUTO_LOCK_MS = 5 * 60 * 1000;
   const REVEAL_TIMEOUT_MS = 30 * 1000;
 
@@ -20,7 +23,9 @@
 
   let autoLockMs = DEFAULT_AUTO_LOCK_MS;
   let autoLockTimer = null;
-  let toastTimer = null;
+  let toastQueue = [];
+  let activeToast = null;
+  let activeTimer = null;
   let revealTimer = null;
   let pendingDeleteId = null;
 
@@ -101,12 +106,56 @@
     vaultScreen.classList.toggle('active', screen === 'vault');
   }
 
-  function showToast(message, type = 'info') {
-    clearTimeout(toastTimer);
-    toast.textContent = message;
-    toast.className = `toast toast-${type}`;
+  // Simple FIFO toast queue. showToast enqueues a message; processToastQueue
+  // displays them one at a time. Persistent toasts (persist = true) stay
+  // visible until hideToast() or setUnsaved(false) is called.
+  function processToastQueue() {
+    if (activeToast) return; // already showing
+    const item = toastQueue.shift();
+    if (!item) return;
+    activeToast = item;
+    toast.textContent = item.message;
+    toast.className = `toast toast-${item.type}`;
     toast.classList.remove('hidden');
-    toastTimer = setTimeout(() => toast.classList.add('hidden'), 3000);
+    if (!item.persist) {
+      activeTimer = setTimeout(() => {
+        // hide current then show next
+        hideToast();
+      }, 3000);
+    } else {
+      activeTimer = null;
+    }
+  }
+
+  function showToast(message, type = 'info', persist = false) {
+    toastQueue.push({ message, type, persist });
+    // process next if nothing is active
+    processToastQueue();
+  }
+
+  function hideToast() {
+    if (activeTimer) {
+      clearTimeout(activeTimer);
+      activeTimer = null;
+    }
+    activeToast = null;
+    toast.classList.add('hidden');
+    toast.textContent = '';
+    // show next toast in queue
+    setTimeout(processToastQueue, 50);
+  }
+
+  // Manage unsaved state and persistent warning toast in one place.
+  function setUnsaved(isUnsaved) {
+    vault.hasExported = !isUnsaved;
+    if (isUnsaved) {
+      // Enqueue a persistent warning; FIFO queue will ensure any immediate
+      // success messages are shown first.
+      showToast('Unsaved changes — please save your changes before close tab.', 'warning', true);
+    } else {
+      // Hide any persistent unsaved notification
+      hideToast();
+    }
   }
 
   function showError(el, message) {
@@ -168,7 +217,7 @@
     vault.editingId = null;
     vault.hasExported = false;
     await activateVault(session);
-    showToast('Vault created. Export a backup before closing this tab.', 'info');
+    showToast('Vault created. Save a backup before closing this tab.', 'info');
   }
 
   async function reUnlockVault(password) {
@@ -539,11 +588,12 @@
     strengthLabel.textContent = result.label;
     passwordStrength.classList.toggle('hidden', !password);
   }
-
   async function exportBackup(filename) {
     const content = await buildExportContent();
     await downloadBackup(content, filename);
     vault.hasExported = true;
+    // Clear unsaved state and show success
+    setUnsaved(false);
     showToast(`Backup downloaded as ${filename}.`, 'success');
   }
 
@@ -551,6 +601,8 @@
     const content = await buildExportContent();
     const savedName = await saveBackupWithPicker(content, defaultExportFilename());
     vault.hasExported = true;
+    // Clear unsaved state and show success
+    setUnsaved(false);
     showToast(`Backup saved as ${savedName}.`, 'success');
     return true;
   }
@@ -581,6 +633,11 @@
     if (added > 0) parts.push(`${added} added`);
     if (updated > 0) parts.push(`${updated} updated`);
     showToast(`Merge complete: ${parts.join(', ') || 'no changes'}.`, 'success');
+
+    // If merge actually changed entries, mark as unsaved and notify the user
+    if (added > 0 || updated > 0) {
+      setUnsaved(true);
+    }
   }
 
   async function importBackup(file, password) {
@@ -591,7 +648,9 @@
     vault.hasExported = true;
     vault.editingId = null;
     await activateVault(session);
-    showToast(`Restored ${vault.entries.length} entries from backup.`, 'success');
+    // Clear unsaved state and show success
+    setUnsaved(false);
+    showToast(`Restored ${vault.entries.length} entries from saved file.`, 'success');
   }
 
   function bindEvents() {
@@ -733,6 +792,8 @@
         });
         showToast('Entry added.', 'success');
       }
+        // Mark vault as having unsaved changes and notify the user
+        setUnsaved(true);
 
       entryModal.close();
       renderEntries(searchInput.value);
@@ -861,6 +922,10 @@
         deleteModal.close();
         renderEntries(searchInput.value);
         showToast('Entry deleted.', 'success');
+                
+        // Mark vault as having unsaved changes and notify the user
+        setUnsaved(true);
+
         trackActivity();
       }
     });
@@ -959,34 +1024,21 @@
       document.addEventListener(event, trackActivity, { passive: true });
     });
 
+    // Show native leave-site confirmation when there are unsaved entries.
+    // Do NOT wipe the in-memory vault here — the user may cancel navigation and expect data to remain.
     window.addEventListener('beforeunload', (e) => {
       if (vault.unlocked && vault.entries.length > 0 && !vault.hasExported) {
         e.preventDefault();
         e.returnValue = '';
       }
-      wipeVault();
     });
 
+    // Only clear in-memory secrets when the page is actually being hidden/unloaded.
     window.addEventListener('pagehide', () => wipeVault());
 
-    // Optionally block native storage to reduce accidental persistence.
-    // Disabled by default because overriding browser globals can break other libraries.
-    // Set BLOCK_NATIVE_STORAGE = true to enable (not recommended for general use).
-    const BLOCK_NATIVE_STORAGE = false;
-    if (BLOCK_NATIVE_STORAGE && typeof Storage !== 'undefined') {
-      const blockStorage = (storage, name) => {
-        storage.setItem = function (key) {
-          console.warn(`[Vault] Blocked write to ${name}:`, key);
-        };
-        storage.getItem = () => null;
-        storage.removeItem = () => {};
-        storage.clear = () => {};
-        storage.key = () => null;
-        Object.defineProperty(storage, 'length', { get: () => 0 });
-      };
-      try { if (typeof localStorage !== 'undefined') blockStorage(localStorage, 'localStorage'); } catch (_) {}
-      try { if (typeof sessionStorage !== 'undefined') blockStorage(sessionStorage, 'sessionStorage'); } catch (_) {}
-    }
+    // Note: Native storage blocking was removed to reduce dead code. If you
+    // need to prevent accidental persistence, consider adding an explicit
+    // small utility module instead of overriding global Storage APIs here.
   }
 
   init();

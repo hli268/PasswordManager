@@ -695,6 +695,12 @@ textarea:focus-visible {
   color: var(--error);
 }
 
+.toast-warning {
+  background: #450a0a;
+  border: 1px solid var(--error);
+  color: var(--error);
+}
+
 @keyframes slideUp {
   from {
     opacity: 0;
