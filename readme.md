@@ -21,8 +21,15 @@ and can be exported to a file. The exported file can be imported back into the a
 - index.html — main UI
 - styles.css — UI styling
 - crypto.js — cryptographic helpers (PBKDF2, AES-GCM, password scoring, id generation)
-- app.js — application logic (vault UI, entries, import/export/merge)
+- vault.js — the domain model: session state, entry CRUD, sorting/filtering, and merge-plan logic.
+- storage.js — backup file I/O: building/encrypting export payloads, saving via the File System Access API or download, and parsing/decrypting restored files.
+- ui.js — all DOM concerns: element lookups, screens, toasts, the entry list renderer, modals (entry, conflict), and the password-reveal masking timer.
+- app.js — the glue: init(), auto-lock timer, activity tracking, and all event bindings, calling into Vault, Storage, and UI
 - deplyment.ps1 — builds a single-file HTML with inlined assets
+
+## Unit Tests
+- npm install
+- npm test --silent -- --runInBand
 
 ## Build a single-file HTML
 - Open PowerShell as user
@@ -49,7 +56,7 @@ and can be exported to a file. The exported file can be imported back into the a
 ## Usage
 ### Create or restore a vault
    - Create Vault: choose a strong master password (minimum recommended length: 12 characters). The master password is used to derive a session key in memory.
-   - Restore a Previous Vault: import an encrypted backup file and provide the master password used to encrypt it.
+   - Restore/open a Previous Vault: import an encrypted backup file and provide the master password used to encrypt it.
 
 ### Add entries
    - Click "Add Entry" and provide Site, Username (optional), Password (enter or generate), and Notes.

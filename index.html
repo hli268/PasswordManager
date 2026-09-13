@@ -22,7 +22,7 @@
 
         <div class="welcome-actions">
           <button type="button" id="create-vault-btn" class="btn btn-primary">Create Vault</button>
-          <button type="button" id="restore-btn" class="btn btn-secondary">Restore a Previous Vault</button>
+          <button type="button" id="restore-btn" class="btn btn-secondary">Restore/open a Previous Vault File</button>
         </div>
       </div>
     </section>
@@ -281,7 +281,11 @@
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
   <script src="crypto.js"></script>
+  <script src="vault.js"></script>
+  <script src="storage.js"></script>
+  <script src="ui.js"></script>
   <script src="app.js"></script>
+
   <script>
     // Open entry modal (use where you wire up the Add Entry button)
     document.getElementById('add-btn').addEventListener('click', () => {
