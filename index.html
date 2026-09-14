@@ -77,10 +77,17 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
             Merge
           </button>
-          <button type="button" id="export-btn" class="btn btn-ghost" title="Save password entries to file">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-            Save As...
-          </button>
+          <!-- Save As split button: main area saves encrypted backup, chevron shows CSV export -->
+          <div class="saveas-split">
+            <button type="button" id="export-btn" class="btn btn-ghost" title="Save password entries to file">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              Save As...
+            </button>
+            <button type="button" id="export-CSV-btn" class="btn btn-ghost split-btn" aria-haspopup="true" aria-expanded="false" title="Export as CSV">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+            </button>
+            <!-- chevron opens the CSV warning dialog directly -->
+          </div>
           <button type="button" id="lock-btn" class="btn btn-ghost" title="Lock vault">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>
             Lock
@@ -140,6 +147,18 @@
       <div class="modal-actions">
         <button type="button" id="entry-cancel" class="btn btn-ghost">Cancel</button>
         <button type="submit" class="btn btn-primary">Save Entry</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- CSV export warning modal -->
+  <dialog id="export-csv-warning-modal" class="modal">
+    <form method="dialog">
+      <h2>Export As CSV — Warning</h2>
+      <p class="modal-desc">Exporting will write your entries as an unencrypted CSV file containing site, username, password, and notes in plain text. Do not share this file. Proceed?</p>
+      <div class="modal-actions">
+        <button type="button" id="cancel-export-csv" class="btn btn-ghost">Cancel</button>
+        <button type="button" id="confirm-export-csv" class="btn btn-primary">Save As CSV</button>
       </div>
     </form>
   </dialog>

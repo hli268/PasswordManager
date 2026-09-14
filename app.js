@@ -16,6 +16,7 @@
   // objects or use DataTransfer to set input.files.
 
   const DEFAULT_AUTO_LOCK_MS = 5 * 60 * 1000;
+  const CLIPBOARD_CLEAR_MS = 15 * 1000;
 
   const $ = (sel) => document.querySelector(sel);
   const el = UI.elements;
@@ -117,21 +118,119 @@
     UI.clearRevealTimer();
   }
 
+  // --- Export helpers -------------------------------------------------
+  // All export paths end the same way: clear the unsaved flag and toast
+  // success. Centralizing that avoids repeating it in every variant below.
+  function finishExport(successMessage) {
+    setUnsaved(false);
+    UI.showToast(successMessage, 'success');
+  }
+
+  // Runs `fn` and swallows a user-cancelled showSaveFilePicker() dialog
+  // (AbortError), which both the backup and CSV picker flows need to do.
+  async function runIfNotAborted(fn) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (err.name === 'AbortError') return undefined;
+      throw err;
+    }
+  }
+
+  function requireUnlockedForExport() {
+    if (!Vault.state.cryptoKey) {
+      UI.showToast('Vault is locked. Unlock to export.', 'error');
+      return false;
+    }
+    return true;
+  }
+
   async function exportBackup(filename) {
     const content = await Storage.buildExportContent(Vault.state.cryptoKey, Vault.state.sessionSalt, Vault.state.entries);
     await Storage.downloadBackup(content, filename);
-    // Clear unsaved state and show success
-    setUnsaved(false);
-    UI.showToast(`Backup downloaded as ${filename}.`, 'success');
+    finishExport(`Backup downloaded as ${filename}.`);
   }
 
   async function exportBackupWithLocationPicker() {
     const content = await Storage.buildExportContent(Vault.state.cryptoKey, Vault.state.sessionSalt, Vault.state.entries);
     const savedName = await Storage.saveBackupWithPicker(content, Storage.defaultExportFilename());
-    // Clear unsaved state and show success
-    setUnsaved(false);
-    UI.showToast(`Backup saved as ${savedName}.`, 'success');
+    finishExport(`Backup saved as ${savedName}.`);
     return true;
+  }
+
+  async function exportCsvWithLocationPicker() {
+    const content = await Storage.buildCsvContent(Vault.state.entries);
+    const savedName = await Storage.saveCsvWithPicker(content, Storage.defaultExportCsvFilename());
+    finishExport(`CSV exported as ${savedName}.`);
+    return true;
+  }
+
+  async function exportCsvDownload() {
+    const content = await Storage.buildCsvContent(Vault.state.entries);
+    const filename = Storage.defaultExportCsvFilename();
+    await Storage.downloadCsv(content, filename);
+    finishExport(`CSV exported as ${filename}.`);
+  }
+
+  // --- Clipboard helper -------------------------------------------------
+  // Shared by the per-entry "copy password" and "copy username" buttons:
+  // write to the clipboard, toast, then clear it shortly after to reduce
+  // exposure.
+  async function copyToClipboard(text, label) {
+    try {
+      await navigator.clipboard.writeText(text);
+      UI.showToast(`${label} copied to clipboard.`, 'success');
+      setTimeout(async () => {
+        try {
+          await navigator.clipboard.writeText('');
+        } catch (_) {
+          // ignore failures to clear clipboard (may require user gesture)
+        }
+      }, CLIPBOARD_CLEAR_MS);
+    } catch {
+      UI.showToast('Could not copy to clipboard.', 'error');
+    }
+  }
+
+  // --- Modal helpers ------------------------------------------------
+  // Shared "reset a few fields, hide the error, open the dialog" flow used
+  // by the create/restore/merge trigger buttons.
+  function openResetModal(modalEl, { resetFields = [], errorEl, focusEl } = {}) {
+    resetFields.forEach((input) => { input.value = ''; });
+    if (errorEl) UI.hideError(errorEl);
+    modalEl.showModal();
+    if (focusEl) focusEl.focus();
+  }
+
+  function wireCancel(buttonSel, modalEl) {
+    $(buttonSel).addEventListener('click', () => modalEl.close());
+  }
+
+  // Shared "pick a backup file + master password, validate, run an async
+  // action while busy, surface any error" flow used by both the restore
+  // and merge forms — they only differ in which fields/action/messages.
+  async function handleBackupFileSubmit({ form, fileInput, passwordInput, errorEl, busyText, missingMessage, action, onSuccess }) {
+    UI.hideError(errorEl);
+
+    const file = fileInput.files[0];
+    const password = passwordInput.value;
+    const submitBtn = form.querySelector('button[type="submit"]');
+
+    if (!file || !password) {
+      UI.showError(errorEl, missingMessage);
+      return;
+    }
+
+    UI.setBusy(submitBtn, true, busyText);
+    try {
+      await action(file, password);
+      passwordInput.value = '';
+      onSuccess?.();
+    } catch (err) {
+      UI.showError(errorEl, err.message);
+    } finally {
+      UI.setBusy(submitBtn, false);
+    }
   }
 
   async function mergeBackup(file, password) {
@@ -173,18 +272,16 @@
     Vault.setEntries(entries);
     Vault.state.hasExported = true;
     await activateVault();
-    // Clear unsaved state and show success
-    setUnsaved(false);
-    UI.showToast(`Restored ${Vault.state.entries.length} entries from saved file.`, 'success');
+    finishExport(`Restored ${Vault.state.entries.length} entries from saved file.`);
   }
 
   function bindEvents() {
     $('#create-vault-btn').addEventListener('click', () => {
-      el.createPassword.value = '';
-      el.createPasswordConfirm.value = '';
-      UI.hideError(el.createError);
-      el.createModal.showModal();
-      el.createPassword.focus();
+      openResetModal(el.createModal, {
+        resetFields: [el.createPassword, el.createPasswordConfirm],
+        errorEl: el.createError,
+        focusEl: el.createPassword,
+      });
     });
 
     el.createForm.addEventListener('submit', async (e) => {
@@ -222,41 +319,30 @@
       }
     });
 
-    $('#create-cancel').addEventListener('click', () => el.createModal.close());
+    wireCancel('#create-cancel', el.createModal);
 
     $('#restore-btn').addEventListener('click', () => {
-      el.restoreFile.value = '';
-      el.restorePassword.value = '';
-      UI.hideError(el.restoreError);
-      el.restoreModal.showModal();
+      openResetModal(el.restoreModal, {
+        resetFields: [el.restoreFile, el.restorePassword],
+        errorEl: el.restoreError,
+      });
     });
 
-    el.restoreForm.addEventListener('submit', async (e) => {
+    el.restoreForm.addEventListener('submit', (e) => {
       e.preventDefault();
-      UI.hideError(el.restoreError);
-
-      const file = el.restoreFile.files[0];
-      const password = el.restorePassword.value;
-      const submitBtn = el.restoreForm.querySelector('button[type="submit"]');
-
-      if (!file || !password) {
-        UI.showError(el.restoreError, 'Please select a backup file and enter the master password.');
-        return;
-      }
-
-      UI.setBusy(submitBtn, true, 'Restoring…');
-      try {
-        await importBackup(file, password);
-        el.restoreModal.close();
-        el.restorePassword.value = '';
-      } catch (err) {
-        UI.showError(el.restoreError, err.message);
-      } finally {
-        UI.setBusy(submitBtn, false);
-      }
+      handleBackupFileSubmit({
+        form: el.restoreForm,
+        fileInput: el.restoreFile,
+        passwordInput: el.restorePassword,
+        errorEl: el.restoreError,
+        busyText: 'Restoring…',
+        missingMessage: 'Please select a backup file and enter the master password.',
+        action: importBackup,
+        onSuccess: () => el.restoreModal.close(),
+      });
     });
 
-    $('#restore-cancel').addEventListener('click', () => el.restoreModal.close());
+    wireCancel('#restore-cancel', el.restoreModal);
 
     el.unlockForm.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -309,7 +395,7 @@
       trackActivity();
     });
 
-    $('#entry-cancel').addEventListener('click', () => el.entryModal.close());
+    wireCancel('#entry-cancel', el.entryModal);
 
     el.entryPassword.addEventListener('input', () => UI.updatePasswordStrength(el.entryPassword.value));
 
@@ -333,20 +419,12 @@
     });
 
     $('#export-btn').addEventListener('click', async () => {
-      if (!Vault.state.cryptoKey) {
-        UI.showToast('Vault is locked. Unlock to export.', 'error');
-        return;
-      }
+      if (!requireUnlockedForExport()) return;
 
       try {
         if (Storage.supportsSaveLocationPicker()) {
-          try {
-            const saved = await exportBackupWithLocationPicker();
-            if (saved) trackActivity();
-          } catch (err) {
-            if (err.name === 'AbortError') return;
-            throw err;
-          }
+          const saved = await runIfNotAborted(exportBackupWithLocationPicker);
+          if (saved) trackActivity();
           return;
         }
 
@@ -384,42 +462,54 @@
       }
     });
 
-    $('#export-cancel').addEventListener('click', () => el.exportModal.close());
+    wireCancel('#export-cancel', el.exportModal);
 
-    $('#merge-btn').addEventListener('click', () => {
-      el.mergeFile.value = '';
-      el.mergePassword.value = '';
-      UI.hideError(el.mergeError);
-      el.mergeModal.showModal();
+    $('#export-CSV-btn').addEventListener('click', () => {
+      if (!requireUnlockedForExport()) return;
+      el.exportCsvWarningModal.showModal();
     });
 
-    el.mergeForm.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      UI.hideError(el.mergeError);
+    wireCancel('#cancel-export-csv', el.exportCsvWarningModal);
 
-      const file = el.mergeFile.files[0];
-      const password = el.mergePassword.value;
-      const submitBtn = el.mergeForm.querySelector('button[type="submit"]');
-
-      if (!file || !password) {
-        UI.showError(el.mergeError, 'Please select a backup file and enter its master password.');
-        return;
-      }
-
-      UI.setBusy(submitBtn, true, 'Merging…');
+    el.exportCsvWarningConfirm.addEventListener('click', async () => {
+      UI.setBusy(el.exportCsvWarningConfirm, true, 'Exporting…');
       try {
-        await mergeBackup(file, password);
-        el.mergeModal.close();
-        el.mergePassword.value = '';
+        if (Storage.supportsSaveLocationPicker()) {
+          await runIfNotAborted(exportCsvWithLocationPicker);
+        } else {
+          await exportCsvDownload();
+        }
+        el.exportCsvWarningModal.close();
         trackActivity();
       } catch (err) {
-        UI.showError(el.mergeError, err.message);
+        UI.showToast(err.message || 'Failed to export CSV.', 'error');
       } finally {
-        UI.setBusy(submitBtn, false);
+        UI.setBusy(el.exportCsvWarningConfirm, false);
       }
     });
 
-    $('#merge-cancel').addEventListener('click', () => el.mergeModal.close());
+    $('#merge-btn').addEventListener('click', () => {
+      openResetModal(el.mergeModal, {
+        resetFields: [el.mergeFile, el.mergePassword],
+        errorEl: el.mergeError,
+      });
+    });
+
+    el.mergeForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      handleBackupFileSubmit({
+        form: el.mergeForm,
+        fileInput: el.mergeFile,
+        passwordInput: el.mergePassword,
+        errorEl: el.mergeError,
+        busyText: 'Merging…',
+        missingMessage: 'Please select a backup file and enter its master password.',
+        action: mergeBackup,
+        onSuccess: () => { el.mergeModal.close(); trackActivity(); },
+      });
+    });
+
+    wireCancel('#merge-cancel', el.mergeModal);
 
     $('#lock-btn').addEventListener('click', () => lockVault());
 
@@ -467,20 +557,7 @@
       }
 
       if (e.target.closest('.copy-btn')) {
-        try {
-          await navigator.clipboard.writeText(entry.password);
-          UI.showToast('Password copied to clipboard.', 'success');
-          // Clear clipboard after a short timeout to reduce exposure
-          setTimeout(async () => {
-            try {
-              await navigator.clipboard.writeText('');
-            } catch (_) {
-              // ignore failures to clear clipboard (may require user gesture)
-            }
-          }, 15000);
-        } catch {
-          UI.showToast('Could not copy to clipboard.', 'error');
-        }
+        await copyToClipboard(entry.password, 'Password');
         trackActivity();
       }
 
@@ -489,20 +566,7 @@
           UI.showToast('No username to copy.', 'info');
           return;
         }
-        try {
-          await navigator.clipboard.writeText(entry.username);
-          UI.showToast('Username copied to clipboard.', 'success');
-          // Clear clipboard after a short timeout
-          setTimeout(async () => {
-            try {
-              await navigator.clipboard.writeText('');
-            } catch (_) {
-              // ignore failures
-            }
-          }, 15000);
-        } catch {
-          UI.showToast('Could not copy to clipboard.', 'error');
-        }
+        await copyToClipboard(entry.username, 'Username');
         trackActivity();
       }
 

@@ -415,6 +415,37 @@ textarea:focus-visible {
   gap: 0.25rem;
 }
 
+/* Save As split button */
+.saveas-split {
+  display: inline-flex;
+  align-items: center;
+  position: relative;
+}
+.saveas-split .split-btn {
+  position: absolute;
+  right: 0;
+  top: 0;
+  height: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 0.6rem;
+  border-left: 1px solid var(--border);
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+.saveas-split > #export-btn {
+  /* make room for the chevron inside the button */
+  padding-right: 2.2rem;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.saveas-split .split-btn svg {
+  width: 14px;
+  height: 14px;
+}
+/* legacy split-menu styles removed (no inline menu used) */
+
 /* Toolbar */
 .vault-toolbar {
   display: flex;

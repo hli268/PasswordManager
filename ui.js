@@ -57,6 +57,9 @@ const UI = (() => {
     exportForm: $('#export-form'),
     exportFilename: $('#export-filename'),
     exportError: $('#export-error'),
+    exportCsvWarningModal: $('#export-csv-warning-modal'),
+    exportCsvWarningConfirm: $('#confirm-export-csv'),
+    exportCsvWarningCancel: $('#cancel-export-csv'),
 
     mergeModal: $('#merge-modal'),
     mergeForm: $('#merge-form'),

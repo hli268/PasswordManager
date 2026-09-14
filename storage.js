@@ -16,13 +16,44 @@ const Storage = (() => {
     return withExt.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
   }
 
-  function defaultExportFilename() {
+  // Shared timestamp-based filename builder. Both the encrypted-backup and
+  // CSV filenames only differ by prefix/extension, so this is the one
+  // source of truth for the timestamp format.
+  function timestampedFilename(prefix, ext) {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    return `vault-backup-${timestamp}.vault`;
+    return `${prefix}-${timestamp}.${ext}`;
+  }
+
+  function defaultExportFilename() {
+    return timestampedFilename('vault-backup', 'vault');
+  }
+
+  function defaultExportCsvFilename() {
+    return timestampedFilename('vault-export', 'csv');
   }
 
   function supportsSaveLocationPicker() {
     return typeof window.showSaveFilePicker === 'function';
+  }
+
+  function _escapeCsvField(value) {
+    if (value == null) return '';
+    const str = String(value);
+    if (/[,"\n]/.test(str)) {
+      return '"' + str.replace(/"/g, '""') + '"';
+    }
+    return str;
+  }
+
+  function buildCsvContent(entries) {
+    // Fields: id, site, username, password, notes
+    const header = ['id', 'site', 'username', 'password', 'notes'];
+    const lines = [header.join(',')];
+    for (const e of entries) {
+      const row = [e.id, e.site, e.username, e.password, e.notes].map(_escapeCsvField).join(',');
+      lines.push(row);
+    }
+    return lines.join('\n');
   }
 
   async function buildExportContent(cryptoKey, sessionSalt, entries) {
@@ -39,13 +70,12 @@ const Storage = (() => {
     return JSON.stringify(encrypted, null, 2);
   }
 
-  async function saveBackupWithPicker(content, suggestedFilename) {
+  // Generic "Save As" via the File System Access API. `accept` follows
+  // showSaveFilePicker's own shape: a MIME type mapped to its extensions.
+  async function saveWithPicker(content, suggestedFilename, description, accept) {
     const handle = await window.showSaveFilePicker({
       suggestedName: suggestedFilename,
-      types: [{
-        description: 'Vault Backup',
-        accept: { 'application/json': ['.vault'] },
-      }],
+      types: [{ description, accept }],
     });
 
     const writable = await handle.createWritable();
@@ -54,14 +84,35 @@ const Storage = (() => {
     return handle.name;
   }
 
-  async function downloadBackup(content, filename) {
-    const blob = new Blob([content], { type: 'application/json' });
+  function saveBackupWithPicker(content, suggestedFilename) {
+    return saveWithPicker(content, suggestedFilename, 'Backup Vault', {
+      'application/json': ['.vault'],
+    });
+  }
+
+  function saveCsvWithPicker(content, suggestedFilename) {
+    return saveWithPicker(content, suggestedFilename, 'Export to CSV', {
+      'text/csv': ['.csv'],
+    });
+  }
+
+  // Generic plain-download fallback for browsers without the picker API.
+  function downloadFile(content, filename, mimeType) {
+    const blob = new Blob([content], { type: mimeType });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
     a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+  }
+
+  function downloadBackup(content, filename) {
+    return downloadFile(content, filename, 'application/json');
+  }
+
+  function downloadCsv(content, filename) {
+    return downloadFile(content, filename, 'text/csv');
   }
 
   async function parseBackupFile(file, password) {
@@ -80,10 +131,14 @@ const Storage = (() => {
   return {
     sanitizeFilename,
     defaultExportFilename,
+    defaultExportCsvFilename,
     supportsSaveLocationPicker,
     buildExportContent,
+    buildCsvContent,
     saveBackupWithPicker,
+    saveCsvWithPicker,
     downloadBackup,
+    downloadCsv,
     parseBackupFile,
   };
 })();
