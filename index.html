@@ -21,8 +21,8 @@
         <p class="subtitle">Session-only password manager. Data lives in memory and is erased when you close this tab.</p>
 
         <div class="welcome-actions">
-          <button type="button" id="create-vault-btn" class="btn btn-primary">Create Vault</button>
-          <button type="button" id="restore-btn" class="btn btn-secondary">Restore/open a Previous Vault File</button>
+          <button type="button" id="create-vault-btn" class="btn btn-primary">Create a Vault</button>
+          <button type="button" id="restore-btn" class="btn btn-secondary">Restore a Previous Vault</button>
         </div>
       </div>
     </section>
@@ -73,7 +73,7 @@
             <option value="900000">15 min</option>
             <option value="1800000">30 min</option>
           </select>
-          <button type="button" id="merge-btn" class="btn btn-ghost" title="Merge from backup">
+          <button type="button" id="merge-btn" class="btn btn-ghost" title="Merge from backup Vault">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
             Merge
           </button>
@@ -163,10 +163,10 @@
     </form>
   </dialog>
 
-  <!-- Create vault modal -->
+  <!-- Create a vault modal -->
   <dialog id="create-modal" class="modal">
     <form id="create-form" method="dialog">
-      <h2>Create Vault</h2>
+      <h2>Create a Vault</h2>
       <p class="modal-desc">Choose a master password for your new vault (minimum 12 characters). You will need it to unlock, export, and restore your backup.</p>
 
       <label for="create-password">Master Password</label>
@@ -190,7 +190,7 @@
       <p id="create-error" class="error hidden"></p>
       <div class="modal-actions">
         <button type="button" id="create-cancel" class="btn btn-ghost">Cancel</button>
-        <button type="submit" class="btn btn-primary">Create Vault</button>
+        <button type="submit" class="btn btn-primary">Create a Vault</button>
       </div>
     </form>
   </dialog>
@@ -215,7 +215,7 @@
   <!-- Merge backup modal -->
   <dialog id="merge-modal" class="modal">
     <form id="merge-form" method="dialog">
-      <h2>Merge from Backup</h2>
+      <h2>Merge from Backup Vault</h2>
       <p class="modal-desc">Import entries from a backup file and merge them into your current vault. Entries with the same site and username but different passwords will require your confirmation.</p>
 
       <label for="merge-file">Backup File</label>
@@ -261,7 +261,7 @@
   <!-- Restore backup modal -->
   <dialog id="restore-modal" class="modal">
     <form id="restore-form" method="dialog">
-      <h2>Restore from Backup</h2>
+      <h2>Restore A Previous Vault</h2>
       <p class="modal-desc">Select an encrypted backup file and enter the master password used when it was exported.</p>
 
       <label for="restore-file">Backup File</label>

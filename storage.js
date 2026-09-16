@@ -85,7 +85,7 @@ const Storage = (() => {
   }
 
   function saveBackupWithPicker(content, suggestedFilename) {
-    return saveWithPicker(content, suggestedFilename, 'Backup Vault', {
+    return saveWithPicker(content, suggestedFilename, 'Vault', {
       'application/json': ['.vault'],
     });
   }

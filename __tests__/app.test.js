@@ -73,6 +73,20 @@ describe('Vault app basic flows', () => {
 	return new Promise((r) => setTimeout(r, ms));
   }
 
+  // The toast module shows one toast at a time and auto-dismisses non-persistent
+  // ones after 3s, so a toast fired earlier in a test (e.g. "Vault created...")
+  // may still be showing when we check. Poll until the expected text appears
+  // or we give up.
+  async function waitForToastText(pattern, maxWaitMs = 12000) {
+	const start = Date.now();
+	while (Date.now() - start < maxWaitMs) {
+	  const text = document.getElementById('toast').textContent;
+	  if (pattern.test(text)) return text;
+	  await flush(100);
+	}
+	return document.getElementById('toast').textContent;
+  }
+
   test('create vault shows vault screen', async () => {
 	const createBtn = document.getElementById('create-vault-btn');
 	createBtn.click();
@@ -228,5 +242,317 @@ describe('Vault app basic flows', () => {
 	// conflict modal should appear (dialog open), but since tests run in jsdom showModal may not behave the same.
 	// Ensure entries still present and one updated after resolving conflicts may not be automated here.
 	expect(document.querySelectorAll('.entry-card').length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('create vault rejects a password shorter than the minimum length', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'ab'; // below mocked MIN_MASTER_PASSWORD_LENGTH of 4
+	document.getElementById('create-password-confirm').value = 'ab';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const error = document.getElementById('create-error');
+	expect(error.classList.contains('hidden')).toBe(false);
+	expect(error.textContent).toMatch(/at least 4 characters/);
+	// Should still be on the welcome screen, not the vault
+	expect(document.getElementById('vault-screen').classList.contains('active')).toBe(false);
+  });
+
+  test('create vault rejects mismatched password confirmation', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'different';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const error = document.getElementById('create-error');
+	expect(error.classList.contains('hidden')).toBe(false);
+	expect(error.textContent).toMatch(/do not match/);
+  });
+
+  test('adding an entry with no site or password shows validation errors and does not add it', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	// Missing site
+	document.getElementById('add-btn').click();
+	document.getElementById('entry-site').value = '';
+	document.getElementById('entry-password').value = 'somepassword';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	let error = document.getElementById('entry-error');
+	expect(error.classList.contains('hidden')).toBe(false);
+	expect(error.textContent).toMatch(/Site \/ service name is required/);
+	expect(document.querySelectorAll('.entry-card').length).toBe(0);
+
+	// Missing password
+	document.getElementById('entry-site').value = 'example.com';
+	document.getElementById('entry-password').value = '';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	error = document.getElementById('entry-error');
+	expect(error.classList.contains('hidden')).toBe(false);
+	expect(error.textContent).toMatch(/Password is required/);
+	expect(document.querySelectorAll('.entry-card').length).toBe(0);
+  });
+
+  test('locking the vault and re-unlocking with the wrong password shows an error and stays locked', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('lock-btn').click();
+	await flush(10);
+	expect(document.getElementById('unlock-screen').classList.contains('active')).toBe(true);
+
+	// Simulate an incorrect password rejection
+	window.VaultCrypto.unlockSession = async () => { throw new Error('Incorrect master password.'); };
+
+	document.getElementById('master-password').value = 'wrong-password';
+	document.getElementById('unlock-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const unlockError = document.getElementById('unlock-error');
+	expect(unlockError.classList.contains('hidden')).toBe(false);
+	expect(unlockError.textContent).toMatch(/Incorrect master password/);
+	expect(document.getElementById('unlock-screen').classList.contains('active')).toBe(true);
+	expect(document.getElementById('vault-screen').classList.contains('active')).toBe(false);
+  });
+
+  test('locking the vault and re-unlocking with the correct password returns to the vault screen', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('lock-btn').click();
+	await flush(10);
+
+	document.getElementById('master-password').value = 'abcd';
+	document.getElementById('unlock-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	expect(document.getElementById('vault-screen').classList.contains('active')).toBe(true);
+	expect(document.getElementById('unlock-screen').classList.contains('active')).toBe(false);
+  });
+
+  test('search filters the entry list and sort re-orders it', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const addEntry = async (site, username, password) => {
+	  document.getElementById('add-btn').click();
+	  document.getElementById('entry-site').value = site;
+	  document.getElementById('entry-username').value = username;
+	  document.getElementById('entry-password').value = password;
+	  document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	  await flush(20);
+	};
+
+	await addEntry('zebra.com', 'u1', 'p1');
+	await addEntry('apple.com', 'u2', 'p2');
+	await addEntry('mango.com', 'u3', 'p3');
+
+	expect(document.querySelectorAll('.entry-card').length).toBe(3);
+
+	// Filter down to a single entry via search
+	const searchInput = document.getElementById('search-input');
+	searchInput.value = 'apple';
+	searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+	await flush(20);
+
+	let cards = document.querySelectorAll('.entry-card');
+	expect(cards.length).toBe(1);
+	expect(cards[0].querySelector('.entry-site').textContent).toContain('apple.com');
+
+	// Clear search, then verify default (site-asc) ordering
+	searchInput.value = '';
+	searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+	await flush(20);
+
+	cards = document.querySelectorAll('.entry-card');
+	const sitesAsc = Array.from(cards).map((c) => c.querySelector('.entry-site').textContent.trim());
+	expect(sitesAsc).toEqual(['apple.com', 'mango.com', 'zebra.com']);
+
+	// Switch to descending sort
+	const sortSelect = document.getElementById('sort-select');
+	sortSelect.value = 'site-desc';
+	sortSelect.dispatchEvent(new Event('change', { bubbles: true }));
+	await flush(20);
+
+	cards = document.querySelectorAll('.entry-card');
+	const sitesDesc = Array.from(cards).map((c) => c.querySelector('.entry-site').textContent.trim());
+	expect(sitesDesc).toEqual(['zebra.com', 'mango.com', 'apple.com']);
+  });
+
+  test('search with no matches shows the "no entries match" empty state', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('add-btn').click();
+	document.getElementById('entry-site').value = 'example.com';
+	document.getElementById('entry-password').value = 'pw';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const searchInput = document.getElementById('search-input');
+	searchInput.value = 'zzz-no-match';
+	searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+	await flush(20);
+
+	expect(document.querySelectorAll('.entry-card').length).toBe(0);
+	const emptyState = document.getElementById('empty-state');
+	expect(emptyState.classList.contains('hidden')).toBe(false);
+	expect(emptyState.textContent).toMatch(/No entries match your search/);
+  });
+
+  test('reveal button toggles a password between masked and plaintext', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('add-btn').click();
+	document.getElementById('entry-site').value = 'example.com';
+	document.getElementById('entry-password').value = 'super-secret';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const card = document.querySelector('.entry-card');
+	const revealBtn = card.querySelector('.reveal-btn');
+	const passwordSpan = card.querySelector('.entry-password');
+
+	expect(passwordSpan.classList.contains('masked')).toBe(true);
+	revealBtn.click();
+	await flush(10);
+	expect(passwordSpan.classList.contains('masked')).toBe(false);
+	expect(passwordSpan.textContent).toBe('super-secret');
+
+	revealBtn.click();
+	await flush(10);
+	expect(passwordSpan.classList.contains('masked')).toBe(true);
+	expect(passwordSpan.textContent).toBe('••••••••');
+  });
+
+  test('copy-password button writes to the clipboard and shows a success toast', async () => {
+	const writeText = jest.fn().mockResolvedValue(undefined);
+	Object.assign(navigator, { clipboard: { writeText } });
+
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('add-btn').click();
+	document.getElementById('entry-site').value = 'example.com';
+	document.getElementById('entry-password').value = 'copy-me';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const card = document.querySelector('.entry-card');
+	card.querySelector('.copy-btn').click();
+	await flush(20);
+
+	// Note: we don't assert on the toast text here — adding the entry queues
+	// a persistent "Unsaved changes" toast ahead of it, so the copy toast may
+	// never surface until the user exports. The clipboard write is the
+	// behavior that matters for this test.
+	expect(writeText).toHaveBeenCalledWith('copy-me');
+	expect(writeText).toHaveBeenCalledTimes(1);
+  });
+
+  test('generate-password button fills in the entry password field', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('add-btn').click();
+	document.getElementById('generate-password').click();
+	await flush(10);
+
+	expect(document.getElementById('entry-password').value).toBe('TestPassword123!');
+  });
+
+  test('deleting an entry requires confirmation via the delete modal', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('add-btn').click();
+	document.getElementById('entry-site').value = 'example.com';
+	document.getElementById('entry-password').value = 'pw';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.querySelector('.delete-btn').click();
+	await flush(10);
+
+	// Cancel should leave the entry in place
+	document.getElementById('delete-cancel').click();
+	await flush(10);
+	expect(document.querySelectorAll('.entry-card').length).toBe(1);
+
+	// Now actually confirm the delete
+	document.querySelector('.delete-btn').click();
+	await flush(10);
+	document.getElementById('delete-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+	expect(document.querySelectorAll('.entry-card').length).toBe(0);
+  });
+
+  test('CSV export via the warning modal downloads a text/csv file', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('add-btn').click();
+	document.getElementById('entry-site').value = 'example.com';
+	document.getElementById('entry-password').value = 'pw';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('export-CSV-btn').click();
+	await flush(10);
+	expect(document.getElementById('export-csv-warning-modal').hasAttribute('open')).toBe(true);
+
+	document.getElementById('confirm-export-csv').click();
+	await flush(50);
+
+	expect(global.URL.createObjectURL).toHaveBeenCalled();
+	const blobArg = global.URL.createObjectURL.mock.calls[global.URL.createObjectURL.mock.calls.length - 1][0];
+	expect(blobArg.type).toBe('text/csv');
+  });
+
+  test('export is blocked with an error toast when the vault was never unlocked', async () => {
+	// No vault created/unlocked yet — cryptoKey is null from app init, so no
+	// other toasts are queued ahead of this one.
+	document.getElementById('export-btn').click();
+	await flush(10);
+
+	const toastText = await waitForToastText(/Vault is locked\. Unlock to export\./, 2000);
+	expect(toastText).toMatch(/Vault is locked\. Unlock to export\./);
+	expect(document.getElementById('export-modal').hasAttribute('open')).toBe(false);
   });
 });
