@@ -35,8 +35,13 @@ describe('Vault app basic flows', () => {
 	  HTMLDialogElement.prototype.close = function () { this.removeAttribute('open'); };
 	}
 
-	// Mock URL.createObjectURL and anchor click to capture downloads
+	// Mock URL.createObjectURL/revokeObjectURL and anchor click to capture
+	// downloads. revokeObjectURL wasn't mocked before, which meant the real
+	// downloadBackup()/downloadCsv() cleanup step threw "URL.revokeObjectURL
+	// is not a function" — silently caught by the export form's try/catch,
+	// so exports appeared to "hang" without ever reaching finishExport().
 	global.URL.createObjectURL = jest.fn(() => 'blob:mock');
+	global.URL.revokeObjectURL = jest.fn();
 	HTMLAnchorElement.prototype.click = function () {
 	  // simulate navigation; record attributes for test
 	  this._clicked = { href: this.href, download: this.download };
@@ -200,7 +205,7 @@ describe('Vault app basic flows', () => {
 	const entries = await window.Storage.parseBackupFile(null, 'abcd');
 	await window.Vault.createSession('abcd');
 	window.Vault.setEntries(entries);
-	window.Vault.state.hasExported = true;
+	window.Vault.markExported();
 	// Show vault screen and render entries
 	window.UI.showScreen('vault');
 	const filtered = window.Vault.filterEntries(window.Vault.state.entries, '');
@@ -469,12 +474,112 @@ describe('Vault app basic flows', () => {
 	card.querySelector('.copy-btn').click();
 	await flush(20);
 
-	// Note: we don't assert on the toast text here — adding the entry queues
-	// a persistent "Unsaved changes" toast ahead of it, so the copy toast may
-	// never surface until the user exports. The clipboard write is the
-	// behavior that matters for this test.
 	expect(writeText).toHaveBeenCalledWith('copy-me');
 	expect(writeText).toHaveBeenCalledTimes(1);
+
+	// Regression check: the "copied to clipboard" toast used to be permanently
+	// stuck behind a persistent "Unsaved changes" toast that never
+	// auto-dismissed (adding an entry queues that warning too). Now that the
+	// unsaved notice is a separate banner instead of a toast, this toast
+	// should still surface once the queue works through the toasts ahead of
+	// it ("Vault created…", "Entry added.").
+	const toastText = await waitForToastText(/Password copied to clipboard/);
+	expect(toastText).toMatch(/Password copied to clipboard/);
+  });
+
+  test('the unsaved-changes banner is shown separately from the toast queue and never blocks other toasts', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	// No unsaved changes yet — banner hidden.
+	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(true);
+
+	// Add several entries back-to-back. Each one marks the vault unsaved; if
+	// the warning were still a persistent *toast*, these would pile up in
+	// the queue and block every "Entry added." toast behind the first one.
+	for (const site of ['a.com', 'b.com', 'c.com']) {
+	  document.getElementById('add-btn').click();
+	  document.getElementById('entry-site').value = site;
+	  document.getElementById('entry-password').value = 'pw';
+	  document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	  await flush(20);
+	}
+
+	// Banner is visible and stays visible (it's not a one-shot toast).
+	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(false);
+	expect(document.getElementById('unsaved-banner').textContent).toMatch(/Unsaved changes/);
+
+	// The toast queue still works through each "Entry added." toast in turn
+	// instead of getting stuck — this is the actual regression check.
+	const toastText = await waitForToastText(/Entry added\./);
+	expect(toastText).toMatch(/Entry added\./);
+
+	// Exporting clears the unsaved state and hides the banner.
+	document.getElementById('export-btn').click();
+	await flush(10);
+	document.getElementById('export-filename').value = 'test-backup';
+	document.querySelector('#export-form button[type="submit"]').click();
+	await flush(50);
+
+	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(true);
+  });
+
+  test('rapid clipboard copies share a single clear timer keyed to the most recent copy', async () => {
+	jest.useFakeTimers();
+	try {
+	  const writeText = jest.fn().mockResolvedValue(undefined);
+	  Object.assign(navigator, { clipboard: { writeText } });
+
+	  document.getElementById('create-vault-btn').click();
+	  document.getElementById('create-password').value = 'abcd';
+	  document.getElementById('create-password-confirm').value = 'abcd';
+	  document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	  await Promise.resolve();
+
+	  document.getElementById('add-btn').click();
+	  document.getElementById('entry-site').value = 'example.com';
+	  document.getElementById('entry-username').value = 'user@example.com';
+	  document.getElementById('entry-password').value = 'pw-secret';
+	  document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	  await Promise.resolve();
+
+	  const card = document.querySelector('.entry-card');
+
+	  // Copy the password at T+0.
+	  card.querySelector('.copy-btn').click();
+	  await Promise.resolve();
+	  await Promise.resolve();
+
+	  // At T+5s, copy the username too. If each copy used its own
+	  // independent 15s timer, the password's timer would still fire at
+	  // T+15s and wipe out the username (copied at T+5s, expected to live
+	  // until T+20s) ten seconds early.
+	  jest.advanceTimersByTime(5000);
+	  card.querySelector('.copy-user-btn').click();
+	  await Promise.resolve();
+	  await Promise.resolve();
+
+	  expect(writeText).toHaveBeenCalledWith('pw-secret');
+	  expect(writeText).toHaveBeenCalledWith('user@example.com');
+
+	  // T+15s overall (10s after the username copy): a naive per-copy timer
+	  // for the password would have already cleared the clipboard here.
+	  jest.advanceTimersByTime(10000);
+	  await Promise.resolve();
+	  expect(writeText).not.toHaveBeenCalledWith('');
+
+	  // T+20s overall (15s after the *username* copy, the most recent one):
+	  // the shared timer should now clear the clipboard exactly once.
+	  jest.advanceTimersByTime(5000);
+	  await Promise.resolve();
+	  expect(writeText).toHaveBeenCalledWith('');
+	  expect(writeText.mock.calls.filter((call) => call[0] === '')).toHaveLength(1);
+	} finally {
+	  jest.useRealTimers();
+	}
   });
 
   test('generate-password button fills in the entry password field', async () => {
@@ -533,7 +638,7 @@ describe('Vault app basic flows', () => {
 	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
 	await flush(20);
 
-	document.getElementById('export-CSV-btn').click();
+	document.getElementById('export-csv-btn').click();
 	await flush(10);
 	expect(document.getElementById('export-csv-warning-modal').hasAttribute('open')).toBe(true);
 
@@ -543,6 +648,43 @@ describe('Vault app basic flows', () => {
 	expect(global.URL.createObjectURL).toHaveBeenCalled();
 	const blobArg = global.URL.createObjectURL.mock.calls[global.URL.createObjectURL.mock.calls.length - 1][0];
 	expect(blobArg.type).toBe('text/csv');
+  });
+
+  test('CSV export does NOT clear the unsaved-changes banner, only an encrypted backup export does', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('add-btn').click();
+	document.getElementById('entry-site').value = 'example.com';
+	document.getElementById('entry-password').value = 'pw';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(false);
+
+	// CSV is a lossy, unencrypted side-export — not a real backup — so it
+	// must leave the "unsaved" state (and banner) exactly as it was.
+	document.getElementById('export-csv-btn').click();
+	await flush(10);
+	document.getElementById('confirm-export-csv').click();
+	await flush(50);
+
+	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(false);
+	expect(window.Vault.state.hasExported).toBe(false);
+
+	// The encrypted ".vault" backup IS the real persisted representation of
+	// the vault, so exporting it is what should actually clear the banner.
+	document.getElementById('export-btn').click();
+	await flush(10);
+	document.getElementById('export-filename').value = 'test-backup';
+	document.querySelector('#export-form button[type="submit"]').click();
+	await flush(50);
+
+	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(true);
+	expect(window.Vault.state.hasExported).toBe(true);
   });
 
   test('export is blocked with an error toast when the vault was never unlocked', async () => {

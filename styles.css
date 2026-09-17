@@ -693,6 +693,28 @@ textarea:focus-visible {
   margin-bottom: 0.5rem;
 }
 
+/* Persistent unsaved-changes banner (separate from the toast queue — see
+   index.html for why). Reuses the warning toast palette for visual
+   consistency. Pinned to the bottom, stacked just above the toast, so it
+   never covers the header buttons (Merge / Export / Lock etc.) up top. */
+.unsaved-banner {
+  position: fixed;
+  bottom: 4.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 0.65rem 1.25rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  font-weight: 500;
+  z-index: 1000;
+  background: #450a0a;
+  border: 1px solid var(--error);
+  color: var(--error);
+  box-shadow: var(--shadow);
+  text-align: center;
+  max-width: calc(100% - 2rem);
+}
+
 /* Toast */
 .toast {
   position: fixed;

@@ -56,7 +56,7 @@ and can be exported to a file. The exported file can be imported back into the a
 ## Usage
 ### Create or restore a vault
    - Create Vault: choose a strong master password (minimum recommended length: 12 characters). The master password is used to derive a session key in memory.
-   - Restore/open a Previous Vault: import an encrypted backup file and provide the master password used to encrypt it.
+   - Restore/Open a Previous Vault: import an encrypted backup file and provide the master password used to encrypt it.
 
 ### Add entries
    - Click "Add Entry" and provide Site, Username (optional), Password (enter or generate), and Notes.

@@ -65,6 +65,29 @@ const Vault = (() => {
     state.entries = entries;
   }
 
+  // Which entry (if any) is currently open for editing in the entry modal.
+  // Exposed as explicit get/set functions rather than letting callers poke
+  // `state.editingId` directly, so this stays a single, greppable seam.
+  function setEditingId(id) {
+    state.editingId = id;
+  }
+
+  function getEditingId() {
+    return state.editingId;
+  }
+
+  // Whether the current in-memory entries have been saved out (exported or
+  // just freshly restored from a file) since the last change. Exposed as
+  // named actions instead of a raw boolean flag so call sites read as
+  // intent ("markExported") rather than incidental state assignment.
+  function markExported() {
+    state.hasExported = true;
+  }
+
+  function markUnexported() {
+    state.hasExported = false;
+  }
+
   function findEntry(id) {
     return state.entries.find((entry) => entry.id === id) || null;
   }
@@ -205,6 +228,10 @@ const Vault = (() => {
     unlock,
     lock,
     setEntries,
+    setEditingId,
+    getEditingId,
+    markExported,
+    markUnexported,
     findEntry,
     addEntry,
     updateEntry,

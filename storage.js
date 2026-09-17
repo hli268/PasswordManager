@@ -4,7 +4,10 @@
  * Pure file/IO concerns: naming, encrypting/decrypting backup payloads,
  * and saving via the File System Access API or a plain download.
  *
- * Depends on the global `VaultCrypto` and `Vault` (loaded separately).
+ * Depends on the global `VaultCrypto` (loaded separately). Deliberately has
+ * no dependency on `Vault` — callers that need entries normalized (e.g. to
+ * fill in missing ids/timestamps) pass a `normalizeEntry` function into
+ * parseBackupFile instead of this module reaching for a `Vault` global.
  */
 const Storage = (() => {
   'use strict';
@@ -46,11 +49,11 @@ const Storage = (() => {
   }
 
   function buildCsvContent(entries) {
-    // Fields: id, site, username, password, notes
-    const header = ['id', 'site', 'username', 'password', 'notes'];
+    // Fields: site, username, password, notes
+    const header = ['site', 'username', 'password', 'notes'];
     const lines = [header.join(',')];
     for (const e of entries) {
-      const row = [e.id, e.site, e.username, e.password, e.notes].map(_escapeCsvField).join(',');
+      const row = [e.site, e.username, e.password, e.notes].map(_escapeCsvField).join(',');
       lines.push(row);
     }
     return lines.join('\n');
@@ -85,7 +88,7 @@ const Storage = (() => {
   }
 
   function saveBackupWithPicker(content, suggestedFilename) {
-    return saveWithPicker(content, suggestedFilename, 'Vault', {
+    return saveWithPicker(content, suggestedFilename, 'Backup Vault', {
       'application/json': ['.vault'],
     });
   }
@@ -115,7 +118,11 @@ const Storage = (() => {
     return downloadFile(content, filename, 'text/csv');
   }
 
-  async function parseBackupFile(file, password) {
+  // `normalizeEntry` is injected by the caller (e.g. `Vault.normalizeEntry`)
+  // rather than referenced as a global, so this module has no compile-time
+  // or runtime dependency on Vault. Defaults to the identity function so
+  // callers that don't need normalization can omit it.
+  async function parseBackupFile(file, password, normalizeEntry = (entry) => entry) {
     const text = await file.text();
     let backup;
     try {
@@ -125,7 +132,7 @@ const Storage = (() => {
     }
 
     const { data } = await VaultCrypto.decrypt(password, backup);
-    return data.entries.map(Vault.normalizeEntry);
+    return data.entries.map(normalizeEntry);
   }
 
   return {

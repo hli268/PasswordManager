@@ -22,7 +22,7 @@
 
         <div class="welcome-actions">
           <button type="button" id="create-vault-btn" class="btn btn-primary">Create a Vault</button>
-          <button type="button" id="restore-btn" class="btn btn-secondary">Restore a Previous Vault</button>
+          <button type="button" id="restore-btn" class="btn btn-secondary">Restore/Open a Previous Vault File</button>
         </div>
       </div>
     </section>
@@ -73,7 +73,7 @@
             <option value="900000">15 min</option>
             <option value="1800000">30 min</option>
           </select>
-          <button type="button" id="merge-btn" class="btn btn-ghost" title="Merge from backup Vault">
+          <button type="button" id="merge-btn" class="btn btn-ghost" title="Merge from backup">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg>
             Merge
           </button>
@@ -83,7 +83,7 @@
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
               Save As...
             </button>
-            <button type="button" id="export-CSV-btn" class="btn btn-ghost split-btn" aria-haspopup="true" aria-expanded="false" title="Export as CSV">
+            <button type="button" id="export-csv-btn" class="btn btn-ghost split-btn" aria-haspopup="true" aria-expanded="false" title="Export as CSV">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
             </button>
             <!-- chevron opens the CSV warning dialog directly -->
@@ -154,19 +154,19 @@
   <!-- CSV export warning modal -->
   <dialog id="export-csv-warning-modal" class="modal">
     <form method="dialog">
-      <h2>Export As CSV — Warning</h2>
+      <h2>Export as CSV — Warning</h2>
       <p class="modal-desc">Exporting will write your entries as an unencrypted CSV file containing site, username, password, and notes in plain text. Do not share this file. Proceed?</p>
       <div class="modal-actions">
         <button type="button" id="cancel-export-csv" class="btn btn-ghost">Cancel</button>
-        <button type="button" id="confirm-export-csv" class="btn btn-primary">Save As CSV</button>
+        <button type="button" id="confirm-export-csv" class="btn btn-primary">Save as CSV</button>
       </div>
     </form>
   </dialog>
 
-  <!-- Create a vault modal -->
+  <!-- Create vault modal -->
   <dialog id="create-modal" class="modal">
     <form id="create-form" method="dialog">
-      <h2>Create a Vault</h2>
+      <h2>Create Vault</h2>
       <p class="modal-desc">Choose a master password for your new vault (minimum 12 characters). You will need it to unlock, export, and restore your backup.</p>
 
       <label for="create-password">Master Password</label>
@@ -190,7 +190,7 @@
       <p id="create-error" class="error hidden"></p>
       <div class="modal-actions">
         <button type="button" id="create-cancel" class="btn btn-ghost">Cancel</button>
-        <button type="submit" class="btn btn-primary">Create a Vault</button>
+        <button type="submit" class="btn btn-primary">Create Vault</button>
       </div>
     </form>
   </dialog>
@@ -215,7 +215,7 @@
   <!-- Merge backup modal -->
   <dialog id="merge-modal" class="modal">
     <form id="merge-form" method="dialog">
-      <h2>Merge from Backup Vault</h2>
+      <h2>Merge from Backup</h2>
       <p class="modal-desc">Import entries from a backup file and merge them into your current vault. Entries with the same site and username but different passwords will require your confirmation.</p>
 
       <label for="merge-file">Backup File</label>
@@ -261,7 +261,7 @@
   <!-- Restore backup modal -->
   <dialog id="restore-modal" class="modal">
     <form id="restore-form" method="dialog">
-      <h2>Restore A Previous Vault</h2>
+      <h2>Restore from Backup</h2>
       <p class="modal-desc">Select an encrypted backup file and enter the master password used when it was exported.</p>
 
       <label for="restore-file">Backup File</label>
@@ -296,6 +296,16 @@
     </form>
   </dialog>
 
+  <!-- Persistent "you have unsaved changes" notice. Separate from the toast
+       queue on purpose: it needs to stay visible indefinitely (until the
+       user exports), and a persistent item sitting in the toast queue would
+       block every transient success/info toast queued behind it. Pinned to
+       the bottom (above the toast, see styles.css) so it never covers the
+       header buttons (Merge / Export / Lock etc.) up top. -->
+  <div id="unsaved-banner" class="unsaved-banner hidden" role="status" aria-live="polite">
+    Unsaved changes — please save your changes before closing this tab.
+  </div>
+
   <!-- Toast notification -->
   <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
 
@@ -304,23 +314,5 @@
   <script src="storage.js"></script>
   <script src="ui.js"></script>
   <script src="app.js"></script>
-
-  <script>
-    // Open entry modal (use where you wire up the Add Entry button)
-    document.getElementById('add-btn').addEventListener('click', () => {
-      const dlg = document.getElementById('entry-modal');
-      if (!dlg) return;
-      if (typeof dlg.showModal === 'function') {
-        dlg.showModal();
-      } else {
-        // Simple fallback for browsers without <dialog>.showModal()
-        dlg.setAttribute('open', '');
-        dlg.style.position = 'fixed';
-        dlg.style.top = '50%';
-        dlg.style.left = '50%';
-        dlg.style.transform = 'translate(-50%, -50%)';
-      }
-    });
-  </script>
 </body>
 </html>

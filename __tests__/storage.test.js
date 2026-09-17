@@ -2,8 +2,12 @@
 
 /**
  * Tests for storage.js (Storage) — filename handling, CSV building,
- * export content building, and backup file parsing. VaultCrypto and
- * Vault are mocked since they're covered in their own test files.
+ * export content building, and backup file parsing. VaultCrypto is mocked
+ * since it's covered in its own test file.
+ *
+ * storage.js has no dependency on Vault: parseBackupFile takes an optional
+ * `normalizeEntry` callback instead of reaching for a `Vault` global, so
+ * these tests exercise that directly rather than stubbing out `window.Vault`.
  */
 
 const fs = require('fs');
@@ -24,10 +28,6 @@ beforeAll(() => {
       if (password !== 'correct') throw new Error('Incorrect master password or corrupted backup file.');
       return { data: { entries: [{ id: '1', site: 'a.com' }] }, sessionSalt: 'salt' };
     }),
-  };
-
-  window.Vault = {
-    normalizeEntry: (raw) => ({ ...raw, normalized: true }),
   };
 
   let src = fs.readFileSync(path.resolve(__dirname, '..', 'storage.js'), 'utf8');
@@ -148,9 +148,23 @@ describe('parseBackupFile', () => {
     );
   });
 
-  test('decrypts valid JSON and normalizes each entry via Vault.normalizeEntry', async () => {
-    const entries = await Storage.parseBackupFile(fakeFile('{"version":2}'), 'correct');
+  test('decrypts valid JSON and normalizes each entry via a supplied normalizeEntry callback', async () => {
+    const normalizeEntry = (raw) => ({ ...raw, normalized: true });
+    const entries = await Storage.parseBackupFile(fakeFile('{"version":2}'), 'correct', normalizeEntry);
     expect(entries).toEqual([{ id: '1', site: 'a.com', normalized: true }]);
+  });
+
+  test('defaults to identity normalization when no normalizeEntry callback is passed', async () => {
+    const entries = await Storage.parseBackupFile(fakeFile('{"version":2}'), 'correct');
+    expect(entries).toEqual([{ id: '1', site: 'a.com' }]);
+  });
+
+  test('does not reference any global Vault object', async () => {
+    // Guards against the old implicit coupling regressing: parseBackupFile
+    // must work even when no `Vault` global exists at all.
+    expect(typeof window.Vault).toBe('undefined');
+    const entries = await Storage.parseBackupFile(fakeFile('{"version":2}'), 'correct', (r) => r);
+    expect(entries).toEqual([{ id: '1', site: 'a.com' }]);
   });
 
   test('propagates the decrypt error for a wrong password', async () => {

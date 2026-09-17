@@ -24,6 +24,7 @@
   let autoLockMs = DEFAULT_AUTO_LOCK_MS;
   let autoLockTimer = null;
   let pendingDeleteId = null;
+  let clipboardClearTimer = null;
 
   function init() {
     if (!VaultCrypto.isAvailable()) {
@@ -51,16 +52,16 @@
     if (Vault.state.unlocked) resetAutoLockTimer();
   }
 
-  // Manage unsaved state and persistent warning toast in one place.
+  // Manage unsaved state and the persistent warning banner in one place.
+  // The banner lives outside the toast queue (see ui.js) specifically so it
+  // can stay visible indefinitely without blocking other toasts.
   function setUnsaved(isUnsaved) {
-    Vault.state.hasExported = !isUnsaved;
     if (isUnsaved) {
-      // Enqueue a persistent warning; FIFO queue will ensure any immediate
-      // success messages are shown first.
-      UI.showToast('Unsaved changes — please save your changes before close tab.', 'warning', true);
+      Vault.markUnexported();
+      UI.showUnsavedBanner();
     } else {
-      // Hide any persistent unsaved notification
-      UI.hideToast();
+      Vault.markExported();
+      UI.hideUnsavedBanner();
     }
   }
 
@@ -119,10 +120,15 @@
   }
 
   // --- Export helpers -------------------------------------------------
-  // All export paths end the same way: clear the unsaved flag and toast
-  // success. Centralizing that avoids repeating it in every variant below.
-  function finishExport(successMessage) {
-    setUnsaved(false);
+  // The encrypted .vault backup is the vault's real persisted
+  // representation, so only it clears the "unsaved changes" state.
+  // A CSV export is a lossy, unencrypted side-export (see the CSV warning
+  // modal) rather than a substitute backup, so it intentionally leaves the
+  // unsaved banner up.
+  function finishExport(successMessage, clearUnsaved = true) {
+    if (clearUnsaved) {
+      setUnsaved(false);
+    }
     UI.showToast(successMessage, 'success');
   }
 
@@ -161,7 +167,7 @@
   async function exportCsvWithLocationPicker() {
     const content = await Storage.buildCsvContent(Vault.state.entries);
     const savedName = await Storage.saveCsvWithPicker(content, Storage.defaultExportCsvFilename());
-    finishExport(`CSV exported as ${savedName}.`);
+    finishExport(`CSV exported as ${savedName}.`, false);
     return true;
   }
 
@@ -169,18 +175,25 @@
     const content = await Storage.buildCsvContent(Vault.state.entries);
     const filename = Storage.defaultExportCsvFilename();
     await Storage.downloadCsv(content, filename);
-    finishExport(`CSV exported as ${filename}.`);
+    finishExport(`CSV exported as ${filename}.`, false);
   }
 
   // --- Clipboard helper -------------------------------------------------
   // Shared by the per-entry "copy password" and "copy username" buttons:
   // write to the clipboard, toast, then clear it shortly after to reduce
-  // exposure.
+  // exposure. Uses a single shared timer (rather than one per copy) so that
+  // copying a second value shortly after the first reschedules the clear
+  // instead of wiping the clipboard early based on the first copy's timer.
   async function copyToClipboard(text, label) {
     try {
       await navigator.clipboard.writeText(text);
       UI.showToast(`${label} copied to clipboard.`, 'success');
-      setTimeout(async () => {
+
+      if (clipboardClearTimer) {
+        clearTimeout(clipboardClearTimer);
+      }
+      clipboardClearTimer = setTimeout(async () => {
+        clipboardClearTimer = null;
         try {
           await navigator.clipboard.writeText('');
         } catch (_) {
@@ -234,7 +247,7 @@
   }
 
   async function mergeBackup(file, password) {
-    const importedEntries = await Storage.parseBackupFile(file, password);
+    const importedEntries = await Storage.parseBackupFile(file, password, Vault.normalizeEntry);
     const { toAdd, conflicts } = Vault.buildMergePlan(Vault.state.entries, importedEntries);
 
     if (toAdd.length === 0 && conflicts.length === 0) {
@@ -267,15 +280,19 @@
   }
 
   async function importBackup(file, password) {
-    const entries = await Storage.parseBackupFile(file, password);
+    const entries = await Storage.parseBackupFile(file, password, Vault.normalizeEntry);
     await Vault.createSession(password);
     Vault.setEntries(entries);
-    Vault.state.hasExported = true;
+    Vault.markExported();
     await activateVault();
     finishExport(`Restored ${Vault.state.entries.length} entries from saved file.`);
   }
 
-  function bindEvents() {
+  // --- Event binding ----------------------------------------------------
+  // Split by feature area instead of one long function, purely for
+  // readability/navigation — behavior is unchanged from before the split.
+
+  function bindCreateVaultEvents() {
     $('#create-vault-btn').addEventListener('click', () => {
       openResetModal(el.createModal, {
         resetFields: [el.createPassword, el.createPasswordConfirm],
@@ -320,7 +337,9 @@
     });
 
     wireCancel('#create-cancel', el.createModal);
+  }
 
+  function bindRestoreEvents() {
     $('#restore-btn').addEventListener('click', () => {
       openResetModal(el.restoreModal, {
         resetFields: [el.restoreFile, el.restorePassword],
@@ -343,7 +362,9 @@
     });
 
     wireCancel('#restore-cancel', el.restoreModal);
+  }
 
+  function bindUnlockEvents() {
     el.unlockForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       const password = el.masterPasswordInput.value;
@@ -353,9 +374,11 @@
       }
       await reUnlockVault(password);
     });
+  }
 
+  function bindEntryFormEvents() {
     $('#add-btn').addEventListener('click', () => {
-      Vault.state.editingId = null;
+      Vault.setEditingId(null);
       UI.openEntryModal();
     });
 
@@ -379,8 +402,9 @@
         return;
       }
 
-      if (Vault.state.editingId) {
-        Vault.updateEntry(Vault.state.editingId, { site, username, password, notes });
+      const editingId = Vault.getEditingId();
+      if (editingId) {
+        Vault.updateEntry(editingId, { site, username, password, notes });
         UI.showToast('Entry updated.', 'success');
       } else {
         Vault.addEntry({ site, username, password, notes });
@@ -404,7 +428,9 @@
       el.entryPassword.type = 'text';
       UI.updatePasswordStrength(el.entryPassword.value);
     });
+  }
 
+  function bindSearchSortEvents() {
     el.searchInput.addEventListener('input', () => {
       refreshEntries();
       trackActivity();
@@ -417,7 +443,9 @@
       resetAutoLockTimer();
       trackActivity();
     });
+  }
 
+  function bindExportEvents() {
     $('#export-btn').addEventListener('click', async () => {
       if (!requireUnlockedForExport()) return;
 
@@ -464,7 +492,7 @@
 
     wireCancel('#export-cancel', el.exportModal);
 
-    $('#export-CSV-btn').addEventListener('click', () => {
+    $('#export-csv-btn').addEventListener('click', () => {
       if (!requireUnlockedForExport()) return;
       el.exportCsvWarningModal.showModal();
     });
@@ -487,7 +515,9 @@
         UI.setBusy(el.exportCsvWarningConfirm, false);
       }
     });
+  }
 
+  function bindMergeEvents() {
     $('#merge-btn').addEventListener('click', () => {
       openResetModal(el.mergeModal, {
         resetFields: [el.mergeFile, el.mergePassword],
@@ -510,7 +540,9 @@
     });
 
     wireCancel('#merge-cancel', el.mergeModal);
+  }
 
+  function bindLockAndDeleteEvents() {
     $('#lock-btn').addEventListener('click', () => lockVault());
 
     el.deleteForm.addEventListener('submit', (e) => {
@@ -533,7 +565,9 @@
       pendingDeleteId = null;
       el.deleteModal.close();
     });
+  }
 
+  function bindEntriesListEvents() {
     el.entriesList.addEventListener('click', async (e) => {
       const card = e.target.closest('.entry-card');
       if (!card) return;
@@ -571,7 +605,7 @@
       }
 
       if (e.target.closest('.edit-btn')) {
-        Vault.state.editingId = entry.id;
+        Vault.setEditingId(entry.id);
         UI.openEntryModal(entry);
         trackActivity();
       }
@@ -582,7 +616,9 @@
         el.deleteModal.showModal();
       }
     });
+  }
 
+  function bindGlobalEvents() {
     document.addEventListener('click', (e) => {
       const btn = e.target.closest('.toggle-visibility');
       if (!btn) return;
@@ -613,6 +649,19 @@
     // Note: Native storage blocking was removed to reduce dead code. If you
     // need to prevent accidental persistence, consider adding an explicit
     // small utility module instead of overriding global Storage APIs here.
+  }
+
+  function bindEvents() {
+    bindCreateVaultEvents();
+    bindRestoreEvents();
+    bindUnlockEvents();
+    bindEntryFormEvents();
+    bindSearchSortEvents();
+    bindExportEvents();
+    bindMergeEvents();
+    bindLockAndDeleteEvents();
+    bindEntriesListEvents();
+    bindGlobalEvents();
   }
 
   init();

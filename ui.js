@@ -76,11 +76,15 @@ const UI = (() => {
     deleteMessage: $('#delete-message'),
 
     toast: $('#toast'),
+    unsavedBanner: $('#unsaved-banner'),
   };
 
-  // Simple FIFO toast queue. showToast enqueues a message; processToastQueue
-  // displays them one at a time. Persistent toasts (persist = true) stay
-  // visible until hideToast() or a caller explicitly hides them.
+  // Simple FIFO toast queue for transient success/info/error/warning
+  // messages. Every toast here is expected to auto-dismiss — there is no
+  // "persistent" toast concept anymore. A persistent notice (like "you have
+  // unsaved changes") belongs in showUnsavedBanner/hideUnsavedBanner below
+  // instead: it lives outside this queue entirely, so a long-lived notice
+  // can never block other toasts from ever being seen.
   let toastQueue = [];
   let activeToast = null;
   let activeTimer = null;
@@ -100,18 +104,14 @@ const UI = (() => {
     elements.toast.textContent = item.message;
     elements.toast.className = `toast toast-${item.type}`;
     elements.toast.classList.remove('hidden');
-    if (!item.persist) {
-      activeTimer = setTimeout(() => {
-        // hide current then show next
-        hideToast();
-      }, 3000);
-    } else {
-      activeTimer = null;
-    }
+    activeTimer = setTimeout(() => {
+      // hide current then show next
+      hideToast();
+    }, 3000);
   }
 
-  function showToast(message, type = 'info', persist = false) {
-    toastQueue.push({ message, type, persist });
+  function showToast(message, type = 'info') {
+    toastQueue.push({ message, type });
     // process next if nothing is active
     processToastQueue();
   }
@@ -126,6 +126,18 @@ const UI = (() => {
     elements.toast.textContent = '';
     // show next toast in queue
     setTimeout(processToastQueue, 50);
+  }
+
+  // Persistent "unsaved changes" notice. Deliberately NOT part of the toast
+  // queue above — it needs to stay visible across an arbitrary number of
+  // other toasts until the user exports, and living outside the queue means
+  // it can never block a later success/info toast from being shown.
+  function showUnsavedBanner() {
+    elements.unsavedBanner.classList.remove('hidden');
+  }
+
+  function hideUnsavedBanner() {
+    elements.unsavedBanner.classList.add('hidden');
   }
 
   function showError(el, message) {
@@ -328,6 +340,8 @@ const UI = (() => {
     showScreen,
     showToast,
     hideToast,
+    showUnsavedBanner,
+    hideUnsavedBanner,
     showError,
     hideError,
     setBusy,

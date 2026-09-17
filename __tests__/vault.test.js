@@ -69,19 +69,19 @@ describe('Vault session lifecycle', () => {
   test('lock clears cryptoKey and editingId but keeps entries in memory', async () => {
     await Vault.createSession('pw1');
     Vault.setEntries([{ id: 'e1' }]);
-    Vault.state.editingId = 'e1';
+    Vault.setEditingId('e1');
 
     Vault.lock();
 
     expect(Vault.state.cryptoKey).toBeNull();
-    expect(Vault.state.editingId).toBeNull();
+    expect(Vault.getEditingId()).toBeNull();
     expect(Vault.state.entries).toEqual([{ id: 'e1' }]);
   });
 
   test('reset clears everything including entries', async () => {
     await Vault.createSession('pw1');
     Vault.setEntries([{ id: 'e1' }]);
-    Vault.state.hasExported = true;
+    Vault.markExported();
 
     Vault.reset();
 
@@ -94,6 +94,24 @@ describe('Vault session lifecycle', () => {
       editingId: null,
       hasExported: false,
     });
+  });
+});
+
+describe('Vault editingId and export-state accessors', () => {
+  test('setEditingId/getEditingId round-trip, defaulting to null', () => {
+    expect(Vault.getEditingId()).toBeNull();
+    Vault.setEditingId('entry-123');
+    expect(Vault.getEditingId()).toBe('entry-123');
+    Vault.setEditingId(null);
+    expect(Vault.getEditingId()).toBeNull();
+  });
+
+  test('markExported/markUnexported flip state.hasExported', () => {
+    expect(Vault.state.hasExported).toBe(false);
+    Vault.markExported();
+    expect(Vault.state.hasExported).toBe(true);
+    Vault.markUnexported();
+    expect(Vault.state.hasExported).toBe(false);
   });
 });
 
