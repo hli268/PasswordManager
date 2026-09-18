@@ -88,19 +88,19 @@ describe('supportsSaveLocationPicker', () => {
 describe('buildCsvContent', () => {
   test('writes the expected header row', () => {
     const csv = Storage.buildCsvContent([]);
-    expect(csv).toBe('id,site,username,password,notes');
+    expect(csv).toBe('site,username,password,notes');
   });
 
-  test('writes one row per entry in id,site,username,password,notes order', () => {
+  test('writes one row per entry in site,username,password,notes order', () => {
     const csv = Storage.buildCsvContent([
-      { id: '1', site: 'a.com', username: 'u1', password: 'p1', notes: 'n1' },
+      { site: 'a.com', username: 'u1', password: 'p1', notes: 'n1' },
     ]);
-    expect(csv).toBe('id,site,username,password,notes\n1,a.com,u1,p1,n1');
+    expect(csv).toBe('site,username,password,notes\na.com,u1,p1,n1');
   });
 
   test('quotes and escapes fields containing commas, quotes, or newlines', () => {
     const csv = Storage.buildCsvContent([
-      { id: '1', site: 'a,b', username: 'has "quotes"', password: 'line\nbreak', notes: '' },
+      { site: 'a,b', username: 'has "quotes"', password: 'line\nbreak', notes: '' },
     ]);
     const rows = csv.split('\n');
     // The embedded newline means the record itself spans an extra visual line,
@@ -111,8 +111,8 @@ describe('buildCsvContent', () => {
   });
 
   test('treats null/undefined fields as empty strings', () => {
-    const csv = Storage.buildCsvContent([{ id: '1', site: null, username: undefined, password: 'p', notes: null }]);
-    expect(csv).toBe('id,site,username,password,notes\n1,,,p,');
+    const csv = Storage.buildCsvContent([{ site: null, username: undefined, password: 'p', notes: null }]);
+    expect(csv).toBe('site,username,password,notes\n,,p,');
   });
 });
 
@@ -171,6 +171,102 @@ describe('parseBackupFile', () => {
     await expect(Storage.parseBackupFile(fakeFile('{"version":2}'), 'wrong')).rejects.toThrow(
       /Incorrect master password/
     );
+  });
+});
+
+describe('parseCsvEntries', () => {
+  test('parses a simple header + rows CSV, skipping the header', () => {
+    const csv = 'site,username,password,notes\na.com,u1,p1,n1\nb.com,u2,p2,';
+    const { entries, skipped } = Storage.parseCsvEntries(csv);
+
+    expect(skipped).toBe(0);
+    expect(entries).toEqual([
+      { site: 'a.com', username: 'u1', password: 'p1', notes: 'n1' },
+      { site: 'b.com', username: 'u2', password: 'p2', notes: '' },
+    ]);
+  });
+
+  test('header detection is case-insensitive and tolerates surrounding whitespace', () => {
+    const csv = ' Site , Username , Password , Notes \na.com,u1,p1,n1';
+    const { entries, skipped } = Storage.parseCsvEntries(csv);
+
+    expect(skipped).toBe(0);
+    expect(entries).toEqual([{ site: 'a.com', username: 'u1', password: 'p1', notes: 'n1' }]);
+  });
+
+  test('works without a header row (first row treated as data)', () => {
+    const csv = 'a.com,u1,p1,n1';
+    const { entries, skipped } = Storage.parseCsvEntries(csv);
+
+    expect(skipped).toBe(0);
+    expect(entries).toEqual([{ site: 'a.com', username: 'u1', password: 'p1', notes: 'n1' }]);
+  });
+
+  test('round-trips a value produced by buildCsvContent, including quoted fields', () => {
+    const original = [
+      { site: 'a,b', username: 'has "quotes"', password: 'line\nbreak', notes: 'plain' },
+    ];
+    const csv = Storage.buildCsvContent(original);
+    const { entries, skipped } = Storage.parseCsvEntries(csv);
+
+    expect(skipped).toBe(0);
+    expect(entries).toEqual(original);
+  });
+
+  test('every row becomes its own entry — duplicates are not merged or deduplicated', () => {
+    const csv = 'a.com,u,p1,\na.com,u,p2,';
+    const { entries, skipped } = Storage.parseCsvEntries(csv);
+
+    expect(skipped).toBe(0);
+    expect(entries).toHaveLength(2);
+    expect(entries.map((e) => e.password)).toEqual(['p1', 'p2']);
+  });
+
+  test('skips and counts rows missing a required field (site or password)', () => {
+    const csv = ',u1,p1,n1\na.com,u2,,n2\nb.com,u3,p3,n3';
+    const { entries, skipped } = Storage.parseCsvEntries(csv);
+
+    expect(skipped).toBe(2);
+    expect(entries).toEqual([{ site: 'b.com', username: 'u3', password: 'p3', notes: 'n3' }]);
+  });
+
+  test('skips and counts rows with the wrong number of columns', () => {
+    const csv = 'a.com,u1,p1\nb.com,u2,p2,n2,extra\nc.com,u3,p3,n3';
+    const { entries, skipped } = Storage.parseCsvEntries(csv);
+
+    expect(skipped).toBe(2);
+    expect(entries).toEqual([{ site: 'c.com', username: 'u3', password: 'p3', notes: 'n3' }]);
+  });
+
+  test('ignores a trailing blank line without counting it as skipped', () => {
+    const csv = 'a.com,u1,p1,n1\n';
+    const { entries, skipped } = Storage.parseCsvEntries(csv);
+
+    expect(skipped).toBe(0);
+    expect(entries).toEqual([{ site: 'a.com', username: 'u1', password: 'p1', notes: 'n1' }]);
+  });
+
+  test('preserves internal whitespace in the password field but requires it to be non-blank', () => {
+    const csv = 'a.com,u1,  padded pw  ,n1\nb.com,u2,   ,n2';
+    const { entries, skipped } = Storage.parseCsvEntries(csv);
+
+    expect(skipped).toBe(1);
+    expect(entries).toEqual([{ site: 'a.com', username: 'u1', password: '  padded pw  ', notes: 'n1' }]);
+  });
+
+  test('returns no entries and no skipped count for an empty string', () => {
+    expect(Storage.parseCsvEntries('')).toEqual({ entries: [], skipped: 0 });
+  });
+});
+
+describe('parseCsvFile', () => {
+  function fakeFile(contents) {
+    return { text: async () => contents };
+  }
+
+  test('reads the file and delegates to parseCsvEntries', async () => {
+    const result = await Storage.parseCsvFile(fakeFile('site,username,password,notes\na.com,u1,p1,n1'));
+    expect(result).toEqual({ entries: [{ site: 'a.com', username: 'u1', password: 'p1', notes: 'n1' }], skipped: 0 });
   });
 });
 

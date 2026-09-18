@@ -279,6 +279,84 @@
     }
   }
 
+  // CSV import: unlike mergeBackup above, a CSV file is plaintext, so there's
+  // no password to collect and nothing to decrypt, and there's no conflict
+  // modal. Each parsed row is checked against the vault's current entries
+  // (matching on site+username+notes, case-insensitive/trimmed — see
+  // Vault.findMatchByKeyAndNotes) and handled as one of:
+  //   - no match: a genuinely new entry, so it's added.
+  //   - match with the same password too: an exact duplicate of an entry
+  //     already in memory, so it's skipped silently.
+  //   - match but the password differs: skipped as well (the existing
+  //     password is left alone — importing never overwrites), but reported
+  //     back via a dedicated toast so it isn't a silent, surprising drop.
+  // Entries added this way live in memory exactly like any other entry, and
+  // get encrypted the normal way the next time the vault is exported as an
+  // encrypted .vault backup.
+  async function importCsv(fileInput) {
+    const file = fileInput.files[0];
+    fileInput.value = ''; // allow re-selecting the same file later
+    if (!file) return;
+
+    try {
+      const { entries: parsedEntries, skipped: invalidRows } = await Storage.parseCsvFile(file);
+
+      let added = 0;
+      let duplicates = 0;
+      const passwordMismatchSites = [];
+
+      for (const candidate of parsedEntries) {
+        // Compare against the vault's live entries (including ones already
+        // added earlier in this same loop), so duplicate rows within one
+        // CSV file are caught the same way as duplicates of pre-existing
+        // entries.
+        const match = Vault.findMatchByKeyAndNotes(Vault.state.entries, candidate);
+
+        if (!match) {
+          Vault.addEntry(candidate);
+          added += 1;
+        } else if (match.password === candidate.password) {
+          duplicates += 1;
+        } else {
+          passwordMismatchSites.push(candidate.site);
+        }
+      }
+
+      if (added > 0) {
+        refreshEntries();
+        setUnsaved(true);
+      }
+
+      const parts = [];
+      if (added > 0) parts.push(`${added} added`);
+      if (duplicates > 0) parts.push(`${duplicates} duplicate${duplicates === 1 ? '' : 's'} skipped`);
+      if (passwordMismatchSites.length > 0) {
+        parts.push(`${passwordMismatchSites.length} skipped (password differs)`);
+      }
+      if (invalidRows > 0) parts.push(`${invalidRows} invalid skipped`);
+
+      const message = parts.length > 0
+        ? `CSV import complete: ${parts.join(', ')}.`
+        : 'CSV file had no entries to import.';
+      UI.showToast(message, added > 0 ? 'success' : 'info');
+
+      if (passwordMismatchSites.length > 0) {
+        const MAX_LISTED_SITES = 3;
+        const shown = passwordMismatchSites.slice(0, MAX_LISTED_SITES).join(', ');
+        const remaining = passwordMismatchSites.length - MAX_LISTED_SITES;
+        const suffix = remaining > 0 ? `, and ${remaining} more` : '';
+        UI.showToast(
+            `Password mismatch entries not imported: ${shown}${suffix}.`,
+            'warning'
+        );
+      }
+
+      trackActivity();
+    } catch (err) {
+      UI.showToast(err.message || 'Failed to import CSV.', 'error');
+    }
+  }
+
   async function importBackup(file, password) {
     const entries = await Storage.parseBackupFile(file, password, Vault.normalizeEntry);
     await Vault.createSession(password);
@@ -540,6 +618,15 @@
     });
 
     wireCancel('#merge-cancel', el.mergeModal);
+
+    // CSV import chevron: no modal, no password — straight to the native
+    // file picker. The vault is only reachable (and this button only
+    // visible) once unlocked, same as the encrypted-backup merge above.
+    el.mergeCsvBtn.addEventListener('click', () => {
+      el.mergeCsvFile.click();
+    });
+
+    el.mergeCsvFile.addEventListener('change', () => importCsv(el.mergeCsvFile));
   }
 
   function bindLockAndDeleteEvents() {

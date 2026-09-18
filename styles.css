@@ -434,7 +434,7 @@ textarea:focus-visible {
   border-top-left-radius: 0;
   border-bottom-left-radius: 0;
 }
-.saveas-split > #export-btn {
+.saveas-split > .split-main {
   /* make room for the chevron inside the button */
   padding-right: 2.2rem;
   border-top-right-radius: 0;

@@ -251,6 +251,41 @@ describe('Vault.entryKey', () => {
   });
 });
 
+describe('Vault.findMatchByKeyAndNotes', () => {
+  test('returns null when no entry matches site+username', () => {
+    Vault.addEntry({ site: 'a.com', username: 'u', password: 'p', notes: '' });
+    expect(Vault.findMatchByKeyAndNotes(Vault.state.entries, { site: 'b.com', username: 'u', notes: '' })).toBeNull();
+  });
+
+  test('returns null when site+username match but notes differ', () => {
+    Vault.addEntry({ site: 'a.com', username: 'u', password: 'p', notes: 'old note' });
+    const match = Vault.findMatchByKeyAndNotes(Vault.state.entries, { site: 'a.com', username: 'u', notes: 'new note' });
+    expect(match).toBeNull();
+  });
+
+  test('matches on site+username+notes case-insensitively/trimmed for site+username, exact for notes', () => {
+    const existing = Vault.addEntry({ site: 'Example.com', username: ' User@Example.com ', password: 'p', notes: 'a note' });
+    const match = Vault.findMatchByKeyAndNotes(Vault.state.entries, {
+      site: '  example.COM  ',
+      username: 'user@example.com',
+      notes: 'a note',
+    });
+    expect(match).toEqual(existing);
+  });
+
+  test('does not match when notes differ only in case (notes comparison is exact)', () => {
+    Vault.addEntry({ site: 'a.com', username: 'u', password: 'p', notes: 'Note' });
+    const match = Vault.findMatchByKeyAndNotes(Vault.state.entries, { site: 'a.com', username: 'u', notes: 'note' });
+    expect(match).toBeNull();
+  });
+
+  test('ignores password entirely when matching', () => {
+    const existing = Vault.addEntry({ site: 'a.com', username: 'u', password: 'old-pw', notes: '' });
+    const match = Vault.findMatchByKeyAndNotes(Vault.state.entries, { site: 'a.com', username: 'u', password: 'different-pw', notes: '' });
+    expect(match).toEqual(existing);
+  });
+});
+
 describe('Vault merge logic', () => {
   test('buildMergePlan adds entries with no matching key', () => {
     const current = [{ site: 'a.com', username: 'u', password: 'p1' }];

@@ -66,6 +66,8 @@ const UI = (() => {
     mergeFile: $('#merge-file'),
     mergePassword: $('#merge-password'),
     mergeError: $('#merge-error'),
+    mergeCsvBtn: $('#merge-csv-btn'),
+    mergeCsvFile: $('#merge-csv-file'),
 
     conflictModal: $('#conflict-modal'),
     conflictForm: $('#conflict-form'),

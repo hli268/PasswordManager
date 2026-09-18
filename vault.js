@@ -134,6 +134,22 @@ const Vault = (() => {
     return `${site}|${username}`;
   }
 
+  // Finds an existing entry that matches `candidate` on site+username (see
+  // entryKey — case-insensitive, trimmed) and on notes (exact, trimmed),
+  // ignoring password entirely. Used by CSV import to tell apart:
+  //   - a true duplicate (site+username+notes+password all match) — the
+  //     caller should skip it silently, and
+  //   - a password-only difference (site+username+notes match, password
+  //     doesn't) — the caller should skip it too, but tell the user, since
+  //     silently dropping a different password could look like data loss.
+  // Returns null when no such entry exists, meaning the candidate is a new
+  // entry and should just be added.
+  function findMatchByKeyAndNotes(entries, candidate) {
+    const key = entryKey(candidate);
+    const notes = (candidate.notes || '').trim();
+    return entries.find((entry) => entryKey(entry) === key && (entry.notes || '').trim() === notes) || null;
+  }
+
   function normalizeEntry(raw) {
     return {
       id: raw.id || VaultCrypto.generateId(),
@@ -237,6 +253,7 @@ const Vault = (() => {
     updateEntry,
     deleteEntry,
     entryKey,
+    findMatchByKeyAndNotes,
     normalizeEntry,
     sortEntries,
     filterEntries,

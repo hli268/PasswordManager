@@ -29,6 +29,22 @@ describe('Vault app basic flows', () => {
 	  isAvailable: () => true,
 	};
 
+	// jsdom's File/Blob implementation in this environment doesn't provide
+	// .text() (see the restore-from-backup test below, which works around
+	// the same gap by stubbing Storage.parseBackupFile directly). The CSV
+	// import tests read real File objects instead, so polyfill it via
+	// FileReader rather than adding another stub.
+	if (!File.prototype.text) {
+	  File.prototype.text = function () {
+	    return new Promise((resolve, reject) => {
+	      const reader = new FileReader();
+	      reader.onload = () => resolve(reader.result);
+	      reader.onerror = reject;
+	      reader.readAsText(this);
+	    });
+	  };
+	}
+
 	// Provide dialog.showModal/close shim for jsdom which may not implement them
 	if (typeof HTMLDialogElement !== 'undefined' && !HTMLDialogElement.prototype.showModal) {
 	  HTMLDialogElement.prototype.showModal = function () { this.setAttribute('open', ''); try { this.focus(); } catch (_) {} };
@@ -687,7 +703,204 @@ describe('Vault app basic flows', () => {
 	expect(window.Vault.state.hasExported).toBe(true);
   });
 
+  test('CSV import chevron opens the hidden file input directly (no modal, no password)', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const fileInput = document.getElementById('merge-csv-file');
+	const clickSpy = jest.spyOn(fileInput, 'click');
+
+	document.getElementById('merge-csv-btn').click();
+
+	expect(clickSpy).toHaveBeenCalledTimes(1);
+	// no modal should have opened for the CSV path
+	expect(document.getElementById('merge-modal').hasAttribute('open')).toBe(false);
+  });
+
+  test('importing a CSV file adds valid rows as new entries and skips invalid ones', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const csvContent = [
+	  'site,username,password,notes',
+	  'a.com,u1,p1,n1',
+	  'b.com,u2,p2,',
+	  ',missing-site,p3,', // invalid: no site
+	  'c.com,u4', // invalid: wrong column count
+	].join('\n');
+	const csvFile = new File([csvContent], 'export.csv', { type: 'text/csv' });
+
+	const fileInput = document.getElementById('merge-csv-file');
+	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
+	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+	await flush(50);
+
+	const cards = document.querySelectorAll('.entry-card');
+	expect(cards.length).toBe(2);
+	const sites = Array.from(cards).map((c) => c.querySelector('.entry-site').textContent.trim());
+	expect(sites).toEqual(expect.arrayContaining(['a.com', 'b.com']));
+
+	const toastText = await waitForToastText(/2 added, 2 invalid skipped/);
+	expect(toastText).toMatch(/CSV import complete: 2 added, 2 invalid skipped\./);
+
+	// unsaved changes were introduced by the import
+	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(false);
+
+	// the file input is reset so the same file can be re-selected
+	expect(fileInput.value).toBe('');
+  });
+
+  test('CSV import skips an exact duplicate (all four fields match an existing entry)', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('add-btn').click();
+	document.getElementById('entry-site').value = 'dup.com';
+	document.getElementById('entry-username').value = 'u';
+	document.getElementById('entry-password').value = 'same-pw';
+	document.getElementById('entry-notes').value = 'same note';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	expect(document.querySelectorAll('.entry-card').length).toBe(1);
+
+	// exact same site, username, password, and notes as the existing entry
+	const csvFile = new File(['dup.com,u,same-pw,same note'], 'export.csv', { type: 'text/csv' });
+	const fileInput = document.getElementById('merge-csv-file');
+	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
+	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+	await flush(50);
+
+	// nothing new was added — still just the one entry
+	expect(document.querySelectorAll('.entry-card').length).toBe(1);
+
+	const toastText = await waitForToastText(/1 duplicate skipped/);
+	expect(toastText).toMatch(/CSV import complete: 1 duplicate skipped\./);
+  });
+
+  test('CSV import skips (and warns about) a row that differs only in password, keeping the existing password', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('add-btn').click();
+	document.getElementById('entry-site').value = 'dup.com';
+	document.getElementById('entry-username').value = 'u';
+	document.getElementById('entry-password').value = 'existing-pw';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	expect(document.querySelectorAll('.entry-card').length).toBe(1);
+
+	// same site, username, and (empty) notes, but a different password
+	const csvFile = new File(['dup.com,u,new-pw,'], 'export.csv', { type: 'text/csv' });
+	const fileInput = document.getElementById('merge-csv-file');
+	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
+	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+	await flush(50);
+
+	// no conflict modal, and no new entry — the row is skipped, not merged or appended
+	expect(document.getElementById('conflict-modal').hasAttribute('open')).toBe(false);
+	const cards = document.querySelectorAll('.entry-card');
+	expect(cards.length).toBe(1);
+	expect(window.Vault.findEntry(cards[0].dataset.id).password).toBe('existing-pw');
+
+	const summaryToast = await waitForToastText(/1 skipped \(password differs\)/);
+	expect(summaryToast).toMatch(/CSV import complete: 1 skipped \(password differs\)\./);
+
+	const warningToast = await waitForToastText(/Password mismatch entries not imported/);
+	expect(warningToast).toMatch(/Password mismatch entries not imported: dup\.com\./);
+  });
+
+  test('CSV import lists up to 3 sites for password mismatches and summarizes the rest', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	// Seed pre-existing entries directly (bypassing the add-entry UI/toasts)
+	// so this test isn't stuck waiting through 4 sequential "Entry added."
+	// toasts before the import's own toasts can appear.
+	['one.com', 'two.com', 'three.com', 'four.com'].forEach((site, i) => {
+	  window.Vault.addEntry({ site, username: 'u', password: `pw${i + 1}`, notes: '' });
+	});
+
+	const csvContent = [
+	  'one.com,u,new1,',
+	  'two.com,u,new2,',
+	  'three.com,u,new3,',
+	  'four.com,u,new4,',
+	].join('\n');
+	const csvFile = new File([csvContent], 'export.csv', { type: 'text/csv' });
+	const fileInput = document.getElementById('merge-csv-file');
+	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
+	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+	await flush(50);
+
+	const warningToast = await waitForToastText(/Password mismatch entries not imported/);
+	expect(warningToast).toMatch(/one\.com, two\.com, three\.com, and 1 more/);
+  });
+
+  test('re-importing a previously exported CSV of the current entries adds nothing (all exact duplicates)', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('add-btn').click();
+	document.getElementById('entry-site').value = 'round-trip.com';
+	document.getElementById('entry-username').value = 'u';
+	document.getElementById('entry-password').value = 'pw';
+	document.getElementById('entry-notes').value = 'n';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const exportedCsv = window.Storage.buildCsvContent(window.Vault.state.entries);
+	const csvFile = new File([exportedCsv], 're-import.csv', { type: 'text/csv' });
+	const fileInput = document.getElementById('merge-csv-file');
+	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
+	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+	await flush(50);
+
+	expect(document.querySelectorAll('.entry-card').length).toBe(1);
+	const toastText = await waitForToastText(/1 duplicate skipped/);
+	expect(toastText).toMatch(/CSV import complete: 1 duplicate skipped\./);
+  });
+
+  test('importing an all-invalid CSV adds nothing and reports the skip count without marking unsaved', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const csvFile = new File([',no-site,,'], 'export.csv', { type: 'text/csv' });
+	const fileInput = document.getElementById('merge-csv-file');
+	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
+	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+	await flush(50);
+
+	expect(document.querySelectorAll('.entry-card').length).toBe(0);
+	const toastText = await waitForToastText(/1 invalid skipped/);
+	expect(toastText).toMatch(/CSV import complete: 1 invalid skipped\./);
+	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(true);
+  });
+
   test('export is blocked with an error toast when the vault was never unlocked', async () => {
+
 	// No vault created/unlocked yet — cryptoKey is null from app init, so no
 	// other toasts are queued ahead of this one.
 	document.getElementById('export-btn').click();
