@@ -734,7 +734,7 @@
     // Show native leave-site confirmation when there are unsaved entries.
     // Do NOT wipe the in-memory vault here — the user may cancel navigation and expect data to remain.
     window.addEventListener('beforeunload', (e) => {
-      if (Vault.state.unlocked && Vault.state.entries.length > 0 && !Vault.state.hasExported) {
+      if (Vault.state.entries.length > 0 && !Vault.state.hasExported) {
         e.preventDefault();
         e.returnValue = '';
       }

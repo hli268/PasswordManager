@@ -20,7 +20,7 @@ const Storage = (() => {
 
   function sanitizeFilename(name) {
     const trimmed = name.trim();
-    if (!trimmed) return 'vault-backup.vault';
+    if (!trimmed) return 'vault-export.vault';
     const withExt = trimmed.endsWith('.vault') ? trimmed : `${trimmed}.vault`;
     return withExt.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
   }
@@ -34,7 +34,7 @@ const Storage = (() => {
   }
 
   function defaultExportFilename() {
-    return timestampedFilename('vault-backup', 'vault');
+    return timestampedFilename('vault-export', 'vault');
   }
 
   function defaultExportCsvFilename() {

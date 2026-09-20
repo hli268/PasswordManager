@@ -51,8 +51,8 @@ describe('sanitizeFilename', () => {
   });
 
   test('falls back to a default name when empty or blank', () => {
-    expect(Storage.sanitizeFilename('')).toBe('vault-backup.vault');
-    expect(Storage.sanitizeFilename('   ')).toBe('vault-backup.vault');
+    expect(Storage.sanitizeFilename('')).toBe('vault-export.vault');
+    expect(Storage.sanitizeFilename('   ')).toBe('vault-export.vault');
   });
 
   test('replaces filesystem-illegal characters with underscores', () => {
@@ -63,7 +63,7 @@ describe('sanitizeFilename', () => {
 describe('default export filenames', () => {
   test('defaultExportFilename produces a timestamped .vault filename', () => {
     const name = Storage.defaultExportFilename();
-    expect(name).toMatch(/^vault-backup-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.vault$/);
+    expect(name).toMatch(/^vault-export-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.vault$/);
   });
 
   test('defaultExportCsvFilename produces a timestamped .csv filename', () => {

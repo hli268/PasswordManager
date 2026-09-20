@@ -1049,4 +1049,28 @@ describe('Vault app basic flows', () => {
 	expect(toastText).toMatch(/Vault is locked\. Unlock to export\./);
 	expect(document.getElementById('export-modal').hasAttribute('open')).toBe(false);
   });
+
+  test('beforeunload still warns about unsaved changes while the vault is locked', async () => {
+	  document.getElementById('create-vault-btn').click();
+	  document.getElementById('create-password').value = 'abcd';
+	  document.getElementById('create-password-confirm').value = 'abcd';
+	  document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	  await flush(20);
+
+	  document.getElementById('add-btn').click();
+	  document.getElementById('entry-site').value = 'example.com';
+	  document.getElementById('entry-password').value = 'pw';
+	  document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	  await flush(20);
+
+	  document.getElementById('lock-btn').click();
+	  await flush(10);
+	  expect(window.Vault.state.unlocked).toBe(false);
+	  expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(false);
+
+	  const evt = new Event('beforeunload', { cancelable: true });
+	  window.dispatchEvent(evt);
+	  expect(evt.defaultPrevented).toBe(true);
+  });
+
 });
