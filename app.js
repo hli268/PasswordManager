@@ -479,6 +479,16 @@
         UI.showError(el.entryError, 'Password is required.');
         return;
       }
+      
+      if (password.includes(',')) {
+        UI.showError(el.entryError, 'Password cannot contain a comma (it is used as the CSV field separator).');
+        return;
+      }
+
+      if (/^[ \t]|[ \t]$/.test(password)) {
+        UI.showError(el.entryError, 'Password cannot start or end with a space or tab.');
+        return;
+      }
 
       const editingId = Vault.getEditingId();
       if (editingId) {

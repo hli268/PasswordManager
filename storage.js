@@ -152,10 +152,17 @@ const Storage = (() => {
   // result straight to Vault.addEntry.
   //
   // A row is skipped (and counted in `skipped`) when it doesn't have
-  // exactly 4 columns, or when `site`/`password` is empty. A fully blank
-  // line (e.g. a trailing newline at EOF) is ignored without being counted
-  // as skipped. A leading header row matching site,username,password,notes
-  // (case-insensitive) is detected and skipped automatically.
+  // exactly 4 columns, when `site`/`password` is empty (after trimming),
+  // or when `password` contains a comma (the app's entry form never allows
+  // creating one, since commas in notes/site/username are fine — they get
+  // quoted on export — but a comma-bearing password would only ever come
+  // from hand-edited or foreign CSV data). Leading/trailing whitespace
+  // (spaces and tabs included) is trimmed from the password field on
+  // import, matching the entry form's own rule against it — internal
+  // whitespace is left untouched. A fully blank line (e.g. a trailing
+  // newline at EOF) is ignored without being counted as skipped. A leading
+  // header row matching site,username,password,notes (case-insensitive) is
+  // detected and skipped automatically.
   function parseCsvEntries(text) {
     const records = _parseCsvRecords(text);
     const entries = [];
@@ -178,10 +185,24 @@ const Storage = (() => {
 
       const site = (row[0] || '').trim();
       const username = (row[1] || '').trim();
-      const password = row[2] || ''; // preserve whitespace; only trimmed for the emptiness check below
+      // The entry form never allows a password with leading/trailing space
+      // or tab, so a CSV row with them isn't rejected — it's simply trimmed
+      // to match, the same way site/username/notes already are. Internal
+      // whitespace is left alone.
+      const password = (row[2] || '').trim();
       const notes = (row[3] || '').trim();
 
-      if (!site || !password.trim()) {
+      if (!site || !password) {
+        skipped += 1;
+        continue;
+      }
+
+      // A password with a comma could only get here if the source CSV had
+      // it properly quoted (the parser above handles that fine) — but the
+      // app's own entry form never lets you create one, so treat it as
+      // invalid data rather than silently importing something you can't
+      // recreate by hand.
+      if (password.includes(',')) {
         skipped += 1;
         continue;
       }

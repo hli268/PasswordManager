@@ -100,7 +100,7 @@ describe('buildCsvContent', () => {
 
   test('quotes and escapes fields containing commas, quotes, or newlines', () => {
     const csv = Storage.buildCsvContent([
-      { site: 'a,b', username: 'has "quotes"', password: 'line\nbreak', notes: '' },
+      {site: 'a,b', username: 'has "quotes"', password: 'line\nbreak', notes: '' },
     ]);
     const rows = csv.split('\n');
     // The embedded newline means the record itself spans an extra visual line,
@@ -246,16 +246,38 @@ describe('parseCsvEntries', () => {
     expect(entries).toEqual([{ site: 'a.com', username: 'u1', password: 'p1', notes: 'n1' }]);
   });
 
-  test('preserves internal whitespace in the password field but requires it to be non-blank', () => {
-    const csv = 'a.com,u1,  padded pw  ,n1\nb.com,u2,   ,n2';
+  test('trims leading/trailing whitespace from the password field, preserving internal whitespace, and requires it to be non-blank', () => {
+    const csv = 'a.com,u1,  padded pw  ,n1\nb.com,u2,\t \t,n2';
     const { entries, skipped } = Storage.parseCsvEntries(csv);
 
     expect(skipped).toBe(1);
-    expect(entries).toEqual([{ site: 'a.com', username: 'u1', password: '  padded pw  ', notes: 'n1' }]);
+    expect(entries).toEqual([{ site: 'a.com', username: 'u1', password: 'padded pw', notes: 'n1' }]);
   });
 
   test('returns no entries and no skipped count for an empty string', () => {
     expect(Storage.parseCsvEntries('')).toEqual({ entries: [], skipped: 0 });
+  });
+
+  test('round-trips a notes field containing a comma (quoted on export, un-quoted on import)', () => {
+    const original = [{ site: 'a.com', username: 'u', password: 'p', notes: 'call center, ext. 204' }];
+    const csv = Storage.buildCsvContent(original);
+
+    // the comma in notes means that field must be quoted in the raw CSV
+    expect(csv).toBe('site,username,password,notes\na.com,u,p,"call center, ext. 204"');
+
+    const { entries, skipped } = Storage.parseCsvEntries(csv);
+    expect(skipped).toBe(0);
+    expect(entries).toEqual(original);
+  });
+
+  test('rejects a row whose password contains a comma, even if properly quoted in the CSV', () => {
+    // The CSV parser can extract a quoted comma just fine — this exercises
+    // that the app-level rule (no commas in passwords) still rejects it.
+    const csv = 'a.com,u1,"pass,word",n1\nb.com,u2,okpw,n2';
+    const { entries, skipped } = Storage.parseCsvEntries(csv);
+
+    expect(skipped).toBe(1);
+    expect(entries).toEqual([{ site: 'b.com', username: 'u2', password: 'okpw', notes: 'n2' }]);
   });
 });
 

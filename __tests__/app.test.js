@@ -823,6 +823,145 @@ describe('Vault app basic flows', () => {
 	expect(warningToast).toMatch(/Password mismatch entries not imported: dup\.com\./);
   });
 
+  test('the entry form rejects a password containing a comma and does not add the entry', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	document.getElementById('add-btn').click();
+	document.getElementById('entry-site').value = 'example.com';
+	document.getElementById('entry-password').value = 'pass,word';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const error = document.getElementById('entry-error');
+	expect(error.classList.contains('hidden')).toBe(false);
+	expect(error.textContent).toMatch(/Password cannot contain a comma/);
+	expect(document.querySelectorAll('.entry-card').length).toBe(0);
+
+	// fixing the password (no comma) lets the same submit succeed
+	document.getElementById('entry-password').value = 'passwordok';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	expect(document.querySelectorAll('.entry-card').length).toBe(1);
+  });
+
+  test('the entry form rejects a password with leading or trailing space/tab, for both add and edit', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	// leading space
+	document.getElementById('add-btn').click();
+	document.getElementById('entry-site').value = 'example.com';
+	document.getElementById('entry-password').value = ' leadingspace';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	let error = document.getElementById('entry-error');
+	expect(error.classList.contains('hidden')).toBe(false);
+	expect(error.textContent).toMatch(/cannot start or end with a space or tab/);
+	expect(document.querySelectorAll('.entry-card').length).toBe(0);
+
+	// trailing tab
+	document.getElementById('entry-password').value = 'trailingtab\t';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	error = document.getElementById('entry-error');
+	expect(error.classList.contains('hidden')).toBe(false);
+	expect(error.textContent).toMatch(/cannot start or end with a space or tab/);
+	expect(document.querySelectorAll('.entry-card').length).toBe(0);
+
+	// a valid password (no leading/trailing space/tab, internal space is fine) succeeds
+	document.getElementById('entry-password').value = 'valid password';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+	expect(document.querySelectorAll('.entry-card').length).toBe(1);
+
+	// editing to a leading/trailing-space password is rejected the same way
+	document.querySelector('.edit-btn').click();
+	await flush(10);
+	document.getElementById('entry-password').value = '  bad-edit  ';
+	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	error = document.getElementById('entry-error');
+	expect(error.classList.contains('hidden')).toBe(false);
+	expect(error.textContent).toMatch(/cannot start or end with a space or tab/);
+	// the entry is unchanged
+	expect(window.Vault.state.entries[0].password).toBe('valid password');
+  });
+
+  test('CSV import trims leading/trailing whitespace from the password field instead of rejecting the row', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const csvContent = 'a.com,u1,  padded-pw  ,n1\nb.com,u2,\t\t,n2';
+	const csvFile = new File([csvContent], 'export.csv', { type: 'text/csv' });
+	const fileInput = document.getElementById('merge-csv-file');
+	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
+	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+	await flush(50);
+
+	// a.com's password is trimmed and imported; b.com is all-whitespace so it's invalid
+	const cards = document.querySelectorAll('.entry-card');
+	expect(cards.length).toBe(1);
+	expect(window.Vault.findEntry(cards[0].dataset.id).password).toBe('padded-pw');
+
+	const toastText = await waitForToastText(/1 added, 1 invalid skipped/);
+	expect(toastText).toMatch(/CSV import complete: 1 added, 1 invalid skipped\./);
+  });
+
+  test('CSV import skips a row whose (quoted) password contains a comma, counting it as invalid', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const csvContent = 'a.com,u1,"pass,word",n1\nb.com,u2,okpw,n2';
+	const csvFile = new File([csvContent], 'export.csv', { type: 'text/csv' });
+	const fileInput = document.getElementById('merge-csv-file');
+	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
+	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+	await flush(50);
+
+	const cards = document.querySelectorAll('.entry-card');
+	expect(cards.length).toBe(1);
+	expect(cards[0].querySelector('.entry-site').textContent).toContain('b.com');
+
+	const toastText = await waitForToastText(/1 added, 1 invalid skipped/);
+	expect(toastText).toMatch(/CSV import complete: 1 added, 1 invalid skipped\./);
+  });
+
+  test('CSV import round-trips a notes field containing a comma', async () => {
+	document.getElementById('create-vault-btn').click();
+	document.getElementById('create-password').value = 'abcd';
+	document.getElementById('create-password-confirm').value = 'abcd';
+	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+	await flush(20);
+
+	const csvContent = 'a.com,u1,pw1,"call center, ext. 204"';
+	const csvFile = new File([csvContent], 'export.csv', { type: 'text/csv' });
+	const fileInput = document.getElementById('merge-csv-file');
+	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
+	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+	await flush(50);
+
+	const cards = document.querySelectorAll('.entry-card');
+	expect(cards.length).toBe(1);
+	expect(cards[0].querySelector('.entry-notes').textContent).toBe('call center, ext. 204');
+  });
+
   test('CSV import lists up to 3 sites for password mismatches and summarizes the rest', async () => {
 	document.getElementById('create-vault-btn').click();
 	document.getElementById('create-password').value = 'abcd';
@@ -848,7 +987,7 @@ describe('Vault app basic flows', () => {
 	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
 	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
 	await flush(50);
-
+	
 	const warningToast = await waitForToastText(/Password mismatch entries not imported/);
 	expect(warningToast).toMatch(/one\.com, two\.com, three\.com, and 1 more/);
   });
