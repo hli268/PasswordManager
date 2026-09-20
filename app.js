@@ -351,6 +351,17 @@
         );
       }
 
+      // Warn about any other skipped rows (exact duplicates and invalid
+      // rows). Password mismatches already get their own, more detailed
+      // warning above, so they aren't repeated here.
+      const otherSkipped = [];
+      if (duplicates > 0) otherSkipped.push(`${duplicates} duplicate${duplicates === 1 ? '' : 's'}`);
+      if (invalidRows > 0) otherSkipped.push(`${invalidRows} invalid row${invalidRows === 1 ? '' : 's'}`);
+
+      if (otherSkipped.length > 0) {
+        UI.showToast(`Skipped ${otherSkipped.join(' and ')} during CSV import.`, 'warning');
+      }
+
       trackActivity();
     } catch (err) {
       UI.showToast(err.message || 'Failed to import CSV.', 'error');

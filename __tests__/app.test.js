@@ -1073,4 +1073,201 @@ describe('Vault app basic flows', () => {
 	  expect(evt.defaultPrevented).toBe(true);
   });
 
+    describe('toast durations and CSV skip warnings', () => {
+    async function createVaultViaUI() {
+      document.getElementById('create-vault-btn').click();
+      document.getElementById('create-password').value = 'abcd';
+      document.getElementById('create-password-confirm').value = 'abcd';
+      document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
+      await flush(20);
+    }
+
+    async function importCsvText(csvContent) {
+      const csvFile = new File([csvContent], 'export.csv', { type: 'text/csv' });
+      const fileInput = document.getElementById('merge-csv-file');
+      Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+      await flush(50);
+    }
+
+    test('info and success toasts auto-dismiss after about 3 seconds', () => {
+      jest.useFakeTimers();
+      try {
+        const toast = document.getElementById('toast');
+        const isVisible = () => !toast.classList.contains('hidden');
+
+        window.UI.showToast('info message', 'info');
+        expect(isVisible()).toBe(true);
+        jest.advanceTimersByTime(2900);
+        expect(isVisible()).toBe(true);
+        jest.advanceTimersByTime(200);
+        expect(isVisible()).toBe(false);
+
+        // let the queue's 50ms "show next" timer drain before the next case
+        jest.advanceTimersByTime(100);
+
+        window.UI.showToast('success message', 'success');
+        expect(isVisible()).toBe(true);
+        jest.advanceTimersByTime(3100);
+        expect(isVisible()).toBe(false);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    test('warning toasts stay visible longer than 3 seconds (about 7s)', () => {
+      jest.useFakeTimers();
+      try {
+        const toast = document.getElementById('toast');
+        const isVisible = () => !toast.classList.contains('hidden');
+
+        window.UI.showToast('careful now', 'warning');
+        expect(isVisible()).toBe(true);
+        expect(toast.className).toContain('toast-warning');
+
+        jest.advanceTimersByTime(3100);
+        expect(isVisible()).toBe(true); // an info toast would be gone by now
+
+        jest.advanceTimersByTime(3800); // 6.9s total
+        expect(isVisible()).toBe(true);
+
+        jest.advanceTimersByTime(300); // 7.2s total
+        expect(isVisible()).toBe(false);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    test('error toasts stay visible longer than warnings (about 8s)', () => {
+      jest.useFakeTimers();
+      try {
+        const toast = document.getElementById('toast');
+        const isVisible = () => !toast.classList.contains('hidden');
+
+        window.UI.showToast('something failed', 'error');
+        expect(isVisible()).toBe(true);
+        expect(toast.className).toContain('toast-error');
+
+        jest.advanceTimersByTime(7100);
+        expect(isVisible()).toBe(true); // a warning toast would be gone by now
+
+        jest.advanceTimersByTime(1000); // 8.1s total
+        expect(isVisible()).toBe(false);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    test('an unknown toast type falls back to the 3 second default', () => {
+      jest.useFakeTimers();
+      try {
+        const toast = document.getElementById('toast');
+        window.UI.showToast('mystery type', 'not-a-real-type');
+        expect(toast.classList.contains('hidden')).toBe(false);
+        jest.advanceTimersByTime(3100);
+        expect(toast.classList.contains('hidden')).toBe(true);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    test('a long-lived warning toast delays the next queued toast until it has finished', () => {
+      jest.useFakeTimers();
+      try {
+        const toast = document.getElementById('toast');
+
+        window.UI.showToast('first: warning', 'warning');
+        window.UI.showToast('second: info', 'info');
+
+        expect(toast.textContent).toBe('first: warning');
+        jest.advanceTimersByTime(6900);
+        expect(toast.textContent).toBe('first: warning');
+
+        // warning dismisses at 7s; the next toast is shown 50ms later
+        jest.advanceTimersByTime(300);
+        expect(toast.textContent).toBe('second: info');
+        expect(toast.className).toContain('toast-info');
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    test('CSV import shows a warning toast when an invalid row is skipped', async () => {
+      await createVaultViaUI();
+
+      await importCsvText('a.com,u1,p1,n1\n,no-site,pw,');
+
+      const warning = await waitForToastText(/Skipped 1 invalid row during CSV import/);
+      expect(warning).toMatch(/Skipped 1 invalid row during CSV import\./);
+      expect(document.getElementById('toast').className).toContain('toast-warning');
+      expect(document.querySelectorAll('.entry-card').length).toBe(1);
+    });
+
+    test('CSV import shows a warning toast when an exact duplicate is skipped', async () => {
+      await createVaultViaUI();
+
+      // seed directly to avoid queueing an extra "Entry added." toast
+      window.Vault.addEntry({ site: 'dup.com', username: 'u', password: 'same-pw', notes: 'n' });
+
+      await importCsvText('dup.com,u,same-pw,n');
+
+      const warning = await waitForToastText(/Skipped 1 duplicate during CSV import/);
+      expect(warning).toMatch(/Skipped 1 duplicate during CSV import\./);
+      expect(document.getElementById('toast').className).toContain('toast-warning');
+    });
+
+    test('CSV import warning combines duplicates and invalid rows, with correct pluralization', async () => {
+      await createVaultViaUI();
+
+      window.Vault.addEntry({ site: 'one.com', username: 'u', password: 'pw1', notes: '' });
+      window.Vault.addEntry({ site: 'two.com', username: 'u', password: 'pw2', notes: '' });
+
+      await importCsvText([
+        'one.com,u,pw1,',        // exact duplicate
+        'two.com,u,pw2,',        // exact duplicate
+        ',no-site,pw,',          // invalid: missing site
+        'bad.com,u,',            // invalid: wrong column count
+        'new.com,u,pw3,',        // valid: added
+      ].join('\n'));
+
+      const warning = await waitForToastText(/Skipped 2 duplicates and 2 invalid rows during CSV import/);
+      expect(warning).toMatch(/Skipped 2 duplicates and 2 invalid rows during CSV import\./);
+      expect(document.getElementById('toast').className).toContain('toast-warning');
+      expect(document.querySelectorAll('.entry-card').length).toBe(3);
+    });
+
+    test('CSV import does not show a skip warning when every row is imported', async () => {
+      await createVaultViaUI();
+
+      await importCsvText('a.com,u1,p1,n1\nb.com,u2,p2,n2');
+
+      // wait for the summary toast, then confirm no warning follows it
+      await waitForToastText(/CSV import complete: 2 added\./);
+      await flush(3300); // let the summary toast expire and the queue drain
+
+      const toast = document.getElementById('toast');
+      expect(toast.className).not.toContain('toast-warning');
+      expect(toast.textContent).not.toMatch(/Skipped/);
+    });
+
+    test('a password mismatch warning is not repeated in the generic skip warning', async () => {
+      await createVaultViaUI();
+
+      window.Vault.addEntry({ site: 'mismatch.com', username: 'u', password: 'old-pw', notes: '' });
+      window.Vault.addEntry({ site: 'dup.com', username: 'u', password: 'same-pw', notes: '' });
+
+      await importCsvText([
+        'mismatch.com,u,new-pw,', // password differs -> dedicated mismatch warning
+        'dup.com,u,same-pw,',     // exact duplicate  -> generic skip warning
+      ].join('\n'));
+
+      // mismatch warning shows first (7s), then the generic skip warning
+      const mismatch = await waitForToastText(/Password mismatch entries not imported/);
+      expect(mismatch).toMatch(/mismatch\.com/);
+
+      const generic = await waitForToastText(/Skipped 1 duplicate during CSV import/);
+      expect(generic).toMatch(/^Skipped 1 duplicate during CSV import\.$/);
+      expect(generic).not.toMatch(/mismatch/);
+    });
+  });
 });

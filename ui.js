@@ -12,6 +12,16 @@ const UI = (() => {
   'use strict';
 
   const REVEAL_TIMEOUT_MS = 30 * 1000;
+  // How long each toast type stays on screen. Warnings and errors are
+  // longer because they usually carry information the user has to read
+  // and act on.
+  const TOAST_DURATION_MS = {
+    info: 3000,
+    success: 3000,
+    warning: 7000,
+    error: 8000,
+  };
+  const DEFAULT_TOAST_DURATION_MS = 3000;
 
   const $ = (sel) => document.querySelector(sel);
 
@@ -109,7 +119,7 @@ const UI = (() => {
     activeTimer = setTimeout(() => {
       // hide current then show next
       hideToast();
-    }, 3000);
+    }, TOAST_DURATION_MS[item.type] ?? DEFAULT_TOAST_DURATION_MS);
   }
 
   function showToast(message, type = 'info') {
