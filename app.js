@@ -184,27 +184,52 @@
   // exposure. Uses a single shared timer (rather than one per copy) so that
   // copying a second value shortly after the first reschedules the clear
   // instead of wiping the clipboard early based on the first copy's timer.
-  async function copyToClipboard(text, label) {
+  let clipboardClearPending = false;
+
+  // Returns true if the clipboard was cleared. Never triggers a permission prompt.
+  async function clearClipboardSilently() {
+    try {
+      if (navigator.permissions?.query && !navigator.userActivation?.isActive) {
+        const status = await navigator.permissions.query({ name: 'clipboard-write' });
+        if (status.state !== 'granted') {
+          console.debug('Clipboard clear deferred, permission:', status.state);
+          return false;
+        }
+      }
+    } catch (_) { /* permission can't be queried in this browser; just try the write */ }
+
+    try {
+      await navigator.clipboard.writeText('');
+      return true;
+    } catch (err) {
+      // Typically "Document is not focused" while the user is in another app.
+      console.debug('Clipboard clear failed:', err.name, err.message);
+      return false;
+    }
+  }
+
+  async function attemptPendingClipboardClear() {
+    if (!clipboardClearPending) return;
+    if (await clearClipboardSilently()) clipboardClearPending = false;
+  }
+ 
+ async function copyToClipboard(text, label) {
     try {
       await navigator.clipboard.writeText(text);
       UI.showToast(`${label} copied to clipboard.`, 'success');
-
-      if (clipboardClearTimer) {
-        clearTimeout(clipboardClearTimer);
-      }
+ 
+      // A new copy replaces whatever was pending, so it must not be cleared early.
+      clipboardClearPending = false;
+      clearTimeout(clipboardClearTimer);
       clipboardClearTimer = setTimeout(async () => {
         clipboardClearTimer = null;
-        try {
-          await navigator.clipboard.writeText('');
-        } catch (_) {
-          // ignore failures to clear clipboard (may require user gesture)
-        }
+        clipboardClearPending = !(await clearClipboardSilently());
       }, CLIPBOARD_CLEAR_MS);
     } catch {
       UI.showToast('Could not copy to clipboard.', 'error');
     }
   }
-
+ 
   // --- Modal helpers ------------------------------------------------
   // Shared "reset a few fields, hide the error, open the dialog" flow used
   // by the create/restore/merge trigger buttons.
@@ -753,6 +778,16 @@
 
     // Only clear in-memory secrets when the page is actually being hidden/unloaded.
     window.addEventListener('pagehide', () => wipeVault());
+
+    // If the 15s clear couldn't run (page unfocused / no permission), finish it
+    // as soon as the user is back on the page.
+    window.addEventListener('focus', attemptPendingClipboardClear);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') attemptPendingClipboardClear();
+    });    
+    ['click', 'keydown', 'touchend'].forEach((evt) => {
+      document.addEventListener(evt, attemptPendingClipboardClear, { passive: true });
+    });
 
     // Note: Native storage blocking was removed to reduce dead code. If you
     // need to prevent accidental persistence, consider adding an explicit

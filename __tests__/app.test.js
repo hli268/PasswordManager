@@ -3,1271 +3,751 @@
 const fs = require('fs');
 const path = require('path');
 
-jest.setTimeout(20000);
+jest.setTimeout(10000);
+
+// ---- Read sources once (not per test) -------------------------------------
+const read = (f) => fs.readFileSync(path.resolve(__dirname, '..', f), 'utf8');
+const SRC = {
+  html: read('index.html'),
+  scripts: [
+    read('vault.js').replace(/const\s+Vault\s*=\s*/, 'window.Vault = '),
+    // avoid clashing with the browser's built-in Storage interface
+    read('storage.js').replace(/const\s+Storage\s*=\s*/, 'window.Storage = '),
+    read('ui.js').replace(/const\s+UI\s*=\s*/, 'window.UI = '),
+    read('app.js'),
+  ],
+};
+
+// ---- Small helpers --------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+// In fake-timer mode setTimeout never fires, so settle via microtasks instead
+// (the mocked crypto only needs microtasks).
+let fakeMode = false;
+const microflush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+const tick = (ms = 0) => (fakeMode ? microflush() : new Promise((r) => setTimeout(r, ms)));
+const setVal = (id, v) => { $(id).value = v; };
+const submit = (id) => $(id).dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+const cards = () => Array.from(document.querySelectorAll('.entry-card'));
+const siteNames = () => cards().map((c) => c.querySelector('.entry-site').textContent.trim());
+const isHidden = (id) => $(id).classList.contains('hidden');
+const isActive = (id) => $(id).classList.contains('active');
+
+// Poll a condition instead of sleeping a fixed time.
+async function waitFor(cond, timeout = 2000) {
+  const start = Date.now();
+  while (!cond() && Date.now() - start < timeout) await tick(2);
+  return cond();
+}
 
 describe('Vault app basic flows', () => {
-  let html;
-  let appScript;
+  let toasts;
 
   beforeEach(() => {
-	// Load index.html into JSDOM's document
-	html = fs.readFileSync(path.resolve(__dirname, '..', 'index.html'), 'utf8');
-	document.documentElement.innerHTML = html;
+    document.documentElement.innerHTML = SRC.html;
 
-	// Provide a lightweight VaultCrypto mock on window before loading app.js
-	window.VaultCrypto = {
-	  isAvailable: () => true,
-	  MIN_MASTER_PASSWORD_LENGTH: 4,
-	  createSession: async (pw) => ({ sessionSalt: 'salt', cryptoKey: 'key', verifier: 'ver' }),
-	  unlockSession: async () => 'key',
-	  encryptWithKey: async () => ({ version: 2, algorithm: 'AES-GCM', kdf: 'PBKDF2', iterations: 1, salt: 's', iv: 'i', ciphertext: 'c' }),
-	  encrypt: async () => ({ version: 1, algorithm: 'AES-GCM', kdf: 'PBKDF2', iterations: 1, salt: 's', iv: 'i', ciphertext: 'c' }),
-	  decrypt: async (password, backup) => ({ data: { entries: [] }, sessionSalt: 'salt' }),
-	  scorePassword: () => ({ score: 4, label: 'Good', className: 'strength-good' }),
-	  generatePassword: () => 'TestPassword123!',
-	  generateId: (() => { let i = 1; return () => `id-${i++}`; })(),
-	  isAvailable: () => true,
-	};
+    window.VaultCrypto = {
+      isAvailable: () => true,
+      MIN_MASTER_PASSWORD_LENGTH: 4,
+      createSession: async () => ({ sessionSalt: 'salt', cryptoKey: 'key', verifier: 'ver' }),
+      unlockSession: async () => 'key',
+      encryptWithKey: async () => ({ version: 2, algorithm: 'AES-GCM', kdf: 'PBKDF2', iterations: 1, salt: 's', iv: 'i', ciphertext: 'c' }),
+      encrypt: async () => ({ version: 1, algorithm: 'AES-GCM', kdf: 'PBKDF2', iterations: 1, salt: 's', iv: 'i', ciphertext: 'c' }),
+      decrypt: async () => ({ data: { entries: [] }, sessionSalt: 'salt' }),
+      scorePassword: () => ({ score: 4, label: 'Good', className: 'strength-good' }),
+      generatePassword: () => 'TestPassword123!',
+      generateId: (() => { let i = 1; return () => `id-${i++}`; })(),
+    };
 
-	// jsdom's File/Blob implementation in this environment doesn't provide
-	// .text() (see the restore-from-backup test below, which works around
-	// the same gap by stubbing Storage.parseBackupFile directly). The CSV
-	// import tests read real File objects instead, so polyfill it via
-	// FileReader rather than adding another stub.
-	if (!File.prototype.text) {
-	  File.prototype.text = function () {
-	    return new Promise((resolve, reject) => {
-	      const reader = new FileReader();
-	      reader.onload = () => resolve(reader.result);
-	      reader.onerror = reject;
-	      reader.readAsText(this);
-	    });
-	  };
-	}
+    // jsdom lacks File.text(); polyfill via FileReader.
+    if (!File.prototype.text) {
+      File.prototype.text = function () {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsText(this);
+        });
+      };
+    }
 
-	// Provide dialog.showModal/close shim for jsdom which may not implement them
-	if (typeof HTMLDialogElement !== 'undefined' && !HTMLDialogElement.prototype.showModal) {
-	  HTMLDialogElement.prototype.showModal = function () { this.setAttribute('open', ''); try { this.focus(); } catch (_) {} };
-	  HTMLDialogElement.prototype.close = function () { this.removeAttribute('open'); };
-	}
+    // jsdom may lack <dialog> support.
+    if (!HTMLDialogElement.prototype.showModal) {
+      HTMLDialogElement.prototype.showModal = function () { this.setAttribute('open', ''); };
+      HTMLDialogElement.prototype.close = function () { this.removeAttribute('open'); };
+    }
 
-	// Mock URL.createObjectURL/revokeObjectURL and anchor click to capture
-	// downloads. revokeObjectURL wasn't mocked before, which meant the real
-	// downloadBackup()/downloadCsv() cleanup step threw "URL.revokeObjectURL
-	// is not a function" — silently caught by the export form's try/catch,
-	// so exports appeared to "hang" without ever reaching finishExport().
-	global.URL.createObjectURL = jest.fn(() => 'blob:mock');
-	global.URL.revokeObjectURL = jest.fn();
-	HTMLAnchorElement.prototype.click = function () {
-	  // simulate navigation; record attributes for test
-	  this._clicked = { href: this.href, download: this.download };
-	};
+    global.URL.createObjectURL = jest.fn(() => 'blob:mock');
+    global.URL.revokeObjectURL = jest.fn();
+    HTMLAnchorElement.prototype.click = function () {
+      this._clicked = { href: this.href, download: this.download };
+    };
 
-	// Load Vault, Storage, UI, then app into the document context (app depends on the others)
-	let vaultScript = fs.readFileSync(path.resolve(__dirname, '..', 'vault.js'), 'utf8');
-	// Assign to window to avoid redeclaring globals in the jsdom environment
-	vaultScript = vaultScript.replace(/const\s+Vault\s*=\s*/, 'window.Vault = ');
-	const vaultEl = document.createElement('script');
-	vaultEl.textContent = vaultScript;
-	document.body.appendChild(vaultEl);
+    SRC.scripts.forEach((code) => {
+      const s = document.createElement('script');
+      s.textContent = code;
+      document.body.appendChild(s);
+    });
 
-	let storageScript = fs.readFileSync(path.resolve(__dirname, '..', 'storage.js'), 'utf8');
-	// Avoid clashing with the browser's built-in Storage interface in jsdom
-	storageScript = storageScript.replace(/const\s+Storage\s*=\s*/, 'window.Storage = ');
-	const storageEl = document.createElement('script');
-	storageEl.textContent = storageScript;
-	document.body.appendChild(storageEl);
-
-	let uiScript = fs.readFileSync(path.resolve(__dirname, '..', 'ui.js'), 'utf8');
-	uiScript = uiScript.replace(/const\s+UI\s*=\s*/, 'window.UI = ');
-	const uiEl = document.createElement('script');
-	uiEl.textContent = uiScript;
-	document.body.appendChild(uiEl);
-
-	const appScriptContent = fs.readFileSync(path.resolve(__dirname, '..', 'app.js'), 'utf8');
-	const appScriptEl = document.createElement('script');
-	appScriptEl.textContent = appScriptContent;
-	document.body.appendChild(appScriptEl);
+    // Record every toast synchronously. The real toast queue shows them one at
+    // a time (3-8s each), so asserting on the DOM forced tests to wait it out.
+    toasts = [];
+    const realShowToast = window.UI.showToast;
+    window.UI.showToast = (msg, type) => {
+      toasts.push({ msg, type });
+      return realShowToast.call(window.UI, msg, type);
+    };
   });
 
-  function flush(ms = 0) {
-	return new Promise((r) => setTimeout(r, ms));
+  afterEach(() => {
+    fakeMode = false;
+    jest.useRealTimers();
+  });
+
+  // Fake timers from the very start of a test, so the real toast queue can be
+  // stepped through deterministically (no 3-8s real waits).
+  const useFakeTimers = () => { jest.useFakeTimers(); fakeMode = true; };
+
+  // Steps time forward and records the text of every toast the *real* toast
+  // UI shows, in order (a toast counts as new when the DOM goes hidden -> visible).
+  function drainToasts(totalMs = 60000, step = 25) {
+    const shown = [];
+    let wasVisible = false;
+    for (let t = 0; t < totalMs; t += step) {
+      const visible = !isHidden('toast');
+      if (visible && !wasVisible) shown.push($('toast').textContent);
+      wasVisible = visible;
+      jest.advanceTimersByTime(step);
+    }
+    return shown;
   }
 
-  // The toast module shows one toast at a time and auto-dismisses non-persistent
-  // ones after 3s, so a toast fired earlier in a test (e.g. "Vault created...")
-  // may still be showing when we check. Poll until the expected text appears
-  // or we give up.
-  async function waitForToastText(pattern, maxWaitMs = 12000) {
-	const start = Date.now();
-	while (Date.now() - start < maxWaitMs) {
-	  const text = document.getElementById('toast').textContent;
-	  if (pattern.test(text)) return text;
-	  await flush(100);
-	}
-	return document.getElementById('toast').textContent;
+  const findToast = (re) => toasts.find((t) => re.test(t.msg));
+  const expectToast = (re, type) => {
+    const t = findToast(re);
+    expect(t).toBeTruthy();
+    if (type) expect(t.type).toBe(type);
+    return t.msg;
+  };
+
+  async function createVault(pw = 'abcd', confirm = pw) {
+    $('create-vault-btn').click();
+    setVal('create-password', pw);
+    setVal('create-password-confirm', confirm);
+    submit('create-form');
+    await tick();
   }
 
+  async function addEntry({ site = 'example.com', username = '', password = 'pw', notes = '' } = {}) {
+    $('add-btn').click();
+    setVal('entry-site', site);
+    setVal('entry-username', username);
+    setVal('entry-password', password);
+    setVal('entry-notes', notes);
+    submit('entry-form');
+    await tick();
+  }
+
+  async function exportBackup() {
+    $('export-btn').click();
+    setVal('export-filename', 'test-backup');
+    document.querySelector('#export-form button[type="submit"]').click();
+    await waitFor(() => findToast(/Backup downloaded/));
+  }
+
+  async function exportCsv() {
+    $('export-csv-btn').click();
+    $('confirm-export-csv').click();
+    await waitFor(() => findToast(/CSV exported/));
+  }
+
+  function setFile(inputId, file) {
+    Object.defineProperty($(inputId), 'files', { value: [file], configurable: true });
+  }
+
+  async function importCsvText(csv) {
+    setFile('merge-csv-file', new File([csv], 'export.csv', { type: 'text/csv' }));
+    $('merge-csv-file').dispatchEvent(new Event('change', { bubbles: true }));
+    await waitFor(() => findToast(/CSV import complete|CSV file had no|Failed/));
+  }
+
+  // ---- Vault creation -----------------------------------------------------
   test('create vault shows vault screen', async () => {
-	const createBtn = document.getElementById('create-vault-btn');
-	createBtn.click();
-
-	// fill form
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-
-	// submit
-	const form = document.getElementById('create-form');
-	form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-
-	await flush(50);
-
-	expect(document.getElementById('vault-screen').classList.contains('active')).toBe(true);
-	expect(document.getElementById('welcome-screen').classList.contains('active')).toBe(false);
+    await createVault();
+    expect(isActive('vault-screen')).toBe(true);
+    expect(isActive('welcome-screen')).toBe(false);
   });
 
+  test.each([
+    ['a too-short password', 'ab', 'ab', /at least 4 characters/],
+    ['mismatched confirmation', 'abcd', 'different', /do not match/],
+  ])('create vault rejects %s', async (_, pw, confirm, msg) => {
+    await createVault(pw, confirm);
+    expect($('create-error').classList.contains('hidden')).toBe(false);
+    expect($('create-error').textContent).toMatch(msg);
+    expect(isActive('vault-screen')).toBe(false);
+  });
+
+  // ---- Entry CRUD & validation -------------------------------------------
   test('add, edit, delete entry flows', async () => {
-	// create vault first
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	// add entry
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'example.com';
-	document.getElementById('entry-username').value = 'user@example.com';
-	document.getElementById('entry-password').value = 'pw1234';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(50);
-
-	const entries = document.querySelectorAll('.entry-card');
-	expect(entries.length).toBe(1);
-	expect(entries[0].querySelector('.entry-site').textContent).toContain('example.com');
-
-	// edit entry
-	const editBtn = entries[0].querySelector('.edit-btn');
-	expect(editBtn).toBeTruthy();
-	editBtn.click();
-	await flush(10);
-	const siteInput = document.getElementById('entry-site');
-	siteInput.value = 'changed.com';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(50);
-
-	const updated = document.querySelector('.entry-card .entry-site');
-	expect(updated.textContent).toContain('changed.com');
-
-	// delete entry
-	const delBtn = document.querySelector('.entry-card .delete-btn');
-	delBtn.click();
-	await flush(10);
-	// confirm delete
-	document.getElementById('delete-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(50);
-	expect(document.querySelectorAll('.entry-card').length).toBe(0);
-  });
-
-  test('export (download) produces a download anchor', async () => {
-	// create vault and add one entry
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'x.com';
-	document.getElementById('entry-username').value = 'a@b';
-	document.getElementById('entry-password').value = 'p';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(40);
-
-	// open export modal
-	document.getElementById('export-btn').click();
-	await flush(10);
-	const filenameInput = document.getElementById('export-filename');
-	filenameInput.value = 'test-backup';
-	const submit = document.querySelector('#export-form button[type="submit"]');
-	submit.click();
-	await flush(50);
-
-	// verify an anchor click recorded the download filename
-	const a = document.querySelector('a[download]');
-	// Not all environments will leave the anchor in DOM; instead check that createObjectURL was called
-	expect(global.URL.createObjectURL).toHaveBeenCalled();
-  });
-
-  test('restore from backup imports entries', async () => {
-	// prepare mock decrypt to return entries
-	window.VaultCrypto.decrypt = async () => ({ data: { entries: [ { id: 'id-1', site: 'r.com', username: 'u', password: 'p' } ] }, sessionSalt: 'salt' });
-
-	// open restore modal
-	document.getElementById('restore-btn').click();
-	await flush(10);
-
-	const fileInput = document.getElementById('restore-file');
-	// provide a real File via DataTransfer so jsdom sets input.files correctly
-	const restoreFile = new File([JSON.stringify({ entries: [ { id: 'id-1', site: 'r.com', username: 'u', password: 'p' } ] })], 'backup.vault', { type: 'application/json' });
-	// Define the files property directly to avoid DataTransfer dependency in this test environment
-	Object.defineProperty(fileInput, 'files', { value: [restoreFile], configurable: true });
-	document.getElementById('restore-password').value = 'abcd';
-
-	// In this test environment File.text() may not be available; simulate the import flow
-	window.Storage.parseBackupFile = async () => ([ { id: 'id-1', site: 'r.com', username: 'u', password: 'p' } ]);
-
-	// Perform the same steps the app would: parse, create session, set entries, and render
-	const entries = await window.Storage.parseBackupFile(null, 'abcd');
-	await window.Vault.createSession('abcd');
-	window.Vault.setEntries(entries);
-	window.Vault.markExported();
-	// Show vault screen and render entries
-	window.UI.showScreen('vault');
-	const filtered = window.Vault.filterEntries(window.Vault.state.entries, '');
-	const sorted = window.Vault.sortEntries(filtered, document.getElementById('sort-select').value);
-	window.UI.renderEntries(sorted, { totalCount: window.Vault.state.entries.length, query: '' });
-	await flush(50);
-
-	expect(document.querySelectorAll('.entry-card').length).toBe(1);
-	expect(document.querySelector('.entry-site').textContent).toContain('r.com');
-  });
-
-  test('merge with backup adds entries and shows conflicts', async () => {
-	// create vault and add an entry
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'merge.com';
-	document.getElementById('entry-username').value = 'u';
-	document.getElementById('entry-password').value = 'old';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(40);
-
-	// prepare decrypt to return an entry with same site/username but different password
-	window.VaultCrypto.decrypt = async () => ({ data: { entries: [ { site: 'merge.com', username: 'u', password: 'newpw' } ] }, sessionSalt: 'salt' });
-
-	document.getElementById('merge-btn').click();
-	await flush(10);
-	const fileInput = document.getElementById('merge-file');
-	const mergeFile = new File([JSON.stringify({ entries: [ { site: 'merge.com', username: 'u', password: 'newpw' } ] })], 'backup.vault', { type: 'application/json' });
-	Object.defineProperty(fileInput, 'files', { value: [mergeFile], configurable: true });
-	document.getElementById('merge-password').value = 'abcd';
-	document.getElementById('merge-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(200);
-
-	// conflict modal should appear (dialog open), but since tests run in jsdom showModal may not behave the same.
-	// Ensure entries still present and one updated after resolving conflicts may not be automated here.
-	expect(document.querySelectorAll('.entry-card').length).toBeGreaterThanOrEqual(1);
-  });
-
-  test('create vault rejects a password shorter than the minimum length', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'ab'; // below mocked MIN_MASTER_PASSWORD_LENGTH of 4
-	document.getElementById('create-password-confirm').value = 'ab';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	const error = document.getElementById('create-error');
-	expect(error.classList.contains('hidden')).toBe(false);
-	expect(error.textContent).toMatch(/at least 4 characters/);
-	// Should still be on the welcome screen, not the vault
-	expect(document.getElementById('vault-screen').classList.contains('active')).toBe(false);
-  });
-
-  test('create vault rejects mismatched password confirmation', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'different';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	const error = document.getElementById('create-error');
-	expect(error.classList.contains('hidden')).toBe(false);
-	expect(error.textContent).toMatch(/do not match/);
-  });
-
-  test('adding an entry with no site or password shows validation errors and does not add it', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	// Missing site
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = '';
-	document.getElementById('entry-password').value = 'somepassword';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	let error = document.getElementById('entry-error');
-	expect(error.classList.contains('hidden')).toBe(false);
-	expect(error.textContent).toMatch(/Site \/ service name is required/);
-	expect(document.querySelectorAll('.entry-card').length).toBe(0);
-
-	// Missing password
-	document.getElementById('entry-site').value = 'example.com';
-	document.getElementById('entry-password').value = '';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	error = document.getElementById('entry-error');
-	expect(error.classList.contains('hidden')).toBe(false);
-	expect(error.textContent).toMatch(/Password is required/);
-	expect(document.querySelectorAll('.entry-card').length).toBe(0);
-  });
-
-  test('locking the vault and re-unlocking with the wrong password shows an error and stays locked', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	document.getElementById('lock-btn').click();
-	await flush(10);
-	expect(document.getElementById('unlock-screen').classList.contains('active')).toBe(true);
-
-	// Simulate an incorrect password rejection
-	window.VaultCrypto.unlockSession = async () => { throw new Error('Incorrect master password.'); };
-
-	document.getElementById('master-password').value = 'wrong-password';
-	document.getElementById('unlock-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	const unlockError = document.getElementById('unlock-error');
-	expect(unlockError.classList.contains('hidden')).toBe(false);
-	expect(unlockError.textContent).toMatch(/Incorrect master password/);
-	expect(document.getElementById('unlock-screen').classList.contains('active')).toBe(true);
-	expect(document.getElementById('vault-screen').classList.contains('active')).toBe(false);
-  });
-
-  test('locking the vault and re-unlocking with the correct password returns to the vault screen', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	document.getElementById('lock-btn').click();
-	await flush(10);
-
-	document.getElementById('master-password').value = 'abcd';
-	document.getElementById('unlock-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	expect(document.getElementById('vault-screen').classList.contains('active')).toBe(true);
-	expect(document.getElementById('unlock-screen').classList.contains('active')).toBe(false);
-  });
-
-  test('search filters the entry list and sort re-orders it', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	const addEntry = async (site, username, password) => {
-	  document.getElementById('add-btn').click();
-	  document.getElementById('entry-site').value = site;
-	  document.getElementById('entry-username').value = username;
-	  document.getElementById('entry-password').value = password;
-	  document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	  await flush(20);
-	};
-
-	await addEntry('zebra.com', 'u1', 'p1');
-	await addEntry('apple.com', 'u2', 'p2');
-	await addEntry('mango.com', 'u3', 'p3');
-
-	expect(document.querySelectorAll('.entry-card').length).toBe(3);
-
-	// Filter down to a single entry via search
-	const searchInput = document.getElementById('search-input');
-	searchInput.value = 'apple';
-	searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-	await flush(20);
-
-	let cards = document.querySelectorAll('.entry-card');
-	expect(cards.length).toBe(1);
-	expect(cards[0].querySelector('.entry-site').textContent).toContain('apple.com');
-
-	// Clear search, then verify default (site-asc) ordering
-	searchInput.value = '';
-	searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-	await flush(20);
-
-	cards = document.querySelectorAll('.entry-card');
-	const sitesAsc = Array.from(cards).map((c) => c.querySelector('.entry-site').textContent.trim());
-	expect(sitesAsc).toEqual(['apple.com', 'mango.com', 'zebra.com']);
-
-	// Switch to descending sort
-	const sortSelect = document.getElementById('sort-select');
-	sortSelect.value = 'site-desc';
-	sortSelect.dispatchEvent(new Event('change', { bubbles: true }));
-	await flush(20);
-
-	cards = document.querySelectorAll('.entry-card');
-	const sitesDesc = Array.from(cards).map((c) => c.querySelector('.entry-site').textContent.trim());
-	expect(sitesDesc).toEqual(['zebra.com', 'mango.com', 'apple.com']);
-  });
-
-  test('search with no matches shows the "no entries match" empty state', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'example.com';
-	document.getElementById('entry-password').value = 'pw';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	const searchInput = document.getElementById('search-input');
-	searchInput.value = 'zzz-no-match';
-	searchInput.dispatchEvent(new Event('input', { bubbles: true }));
-	await flush(20);
-
-	expect(document.querySelectorAll('.entry-card').length).toBe(0);
-	const emptyState = document.getElementById('empty-state');
-	expect(emptyState.classList.contains('hidden')).toBe(false);
-	expect(emptyState.textContent).toMatch(/No entries match your search/);
-  });
-
-  test('reveal button toggles a password between masked and plaintext', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'example.com';
-	document.getElementById('entry-password').value = 'super-secret';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	const card = document.querySelector('.entry-card');
-	const revealBtn = card.querySelector('.reveal-btn');
-	const passwordSpan = card.querySelector('.entry-password');
-
-	expect(passwordSpan.classList.contains('masked')).toBe(true);
-	revealBtn.click();
-	await flush(10);
-	expect(passwordSpan.classList.contains('masked')).toBe(false);
-	expect(passwordSpan.textContent).toBe('super-secret');
-
-	revealBtn.click();
-	await flush(10);
-	expect(passwordSpan.classList.contains('masked')).toBe(true);
-	expect(passwordSpan.textContent).toBe('••••••••');
-  });
-
-  test('copy-password button writes to the clipboard and shows a success toast', async () => {
-	const writeText = jest.fn().mockResolvedValue(undefined);
-	Object.assign(navigator, { clipboard: { writeText } });
-
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'example.com';
-	document.getElementById('entry-password').value = 'copy-me';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	const card = document.querySelector('.entry-card');
-	card.querySelector('.copy-btn').click();
-	await flush(20);
-
-	expect(writeText).toHaveBeenCalledWith('copy-me');
-	expect(writeText).toHaveBeenCalledTimes(1);
-
-	// Regression check: the "copied to clipboard" toast used to be permanently
-	// stuck behind a persistent "Unsaved changes" toast that never
-	// auto-dismissed (adding an entry queues that warning too). Now that the
-	// unsaved notice is a separate banner instead of a toast, this toast
-	// should still surface once the queue works through the toasts ahead of
-	// it ("Vault created…", "Entry added.").
-	const toastText = await waitForToastText(/Password copied to clipboard/);
-	expect(toastText).toMatch(/Password copied to clipboard/);
-  });
-
-  test('the unsaved-changes banner is shown separately from the toast queue and never blocks other toasts', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	// No unsaved changes yet — banner hidden.
-	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(true);
-
-	// Add several entries back-to-back. Each one marks the vault unsaved; if
-	// the warning were still a persistent *toast*, these would pile up in
-	// the queue and block every "Entry added." toast behind the first one.
-	for (const site of ['a.com', 'b.com', 'c.com']) {
-	  document.getElementById('add-btn').click();
-	  document.getElementById('entry-site').value = site;
-	  document.getElementById('entry-password').value = 'pw';
-	  document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	  await flush(20);
-	}
-
-	// Banner is visible and stays visible (it's not a one-shot toast).
-	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(false);
-	expect(document.getElementById('unsaved-banner').textContent).toMatch(/Unsaved changes/);
-
-	// The toast queue still works through each "Entry added." toast in turn
-	// instead of getting stuck — this is the actual regression check.
-	const toastText = await waitForToastText(/Entry added\./);
-	expect(toastText).toMatch(/Entry added\./);
-
-	// Exporting clears the unsaved state and hides the banner.
-	document.getElementById('export-btn').click();
-	await flush(10);
-	document.getElementById('export-filename').value = 'test-backup';
-	document.querySelector('#export-form button[type="submit"]').click();
-	await flush(50);
-
-	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(true);
-  });
-
-  test('rapid clipboard copies share a single clear timer keyed to the most recent copy', async () => {
-	jest.useFakeTimers();
-	try {
-	  const writeText = jest.fn().mockResolvedValue(undefined);
-	  Object.assign(navigator, { clipboard: { writeText } });
-
-	  document.getElementById('create-vault-btn').click();
-	  document.getElementById('create-password').value = 'abcd';
-	  document.getElementById('create-password-confirm').value = 'abcd';
-	  document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	  await Promise.resolve();
-
-	  document.getElementById('add-btn').click();
-	  document.getElementById('entry-site').value = 'example.com';
-	  document.getElementById('entry-username').value = 'user@example.com';
-	  document.getElementById('entry-password').value = 'pw-secret';
-	  document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	  await Promise.resolve();
-
-	  const card = document.querySelector('.entry-card');
-
-	  // Copy the password at T+0.
-	  card.querySelector('.copy-btn').click();
-	  await Promise.resolve();
-	  await Promise.resolve();
-
-	  // At T+5s, copy the username too. If each copy used its own
-	  // independent 15s timer, the password's timer would still fire at
-	  // T+15s and wipe out the username (copied at T+5s, expected to live
-	  // until T+20s) ten seconds early.
-	  jest.advanceTimersByTime(5000);
-	  card.querySelector('.copy-user-btn').click();
-	  await Promise.resolve();
-	  await Promise.resolve();
-
-	  expect(writeText).toHaveBeenCalledWith('pw-secret');
-	  expect(writeText).toHaveBeenCalledWith('user@example.com');
-
-	  // T+15s overall (10s after the username copy): a naive per-copy timer
-	  // for the password would have already cleared the clipboard here.
-	  jest.advanceTimersByTime(10000);
-	  await Promise.resolve();
-	  expect(writeText).not.toHaveBeenCalledWith('');
-
-	  // T+20s overall (15s after the *username* copy, the most recent one):
-	  // the shared timer should now clear the clipboard exactly once.
-	  jest.advanceTimersByTime(5000);
-	  await Promise.resolve();
-	  expect(writeText).toHaveBeenCalledWith('');
-	  expect(writeText.mock.calls.filter((call) => call[0] === '')).toHaveLength(1);
-	} finally {
-	  jest.useRealTimers();
-	}
-  });
-
-  test('generate-password button fills in the entry password field', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	document.getElementById('add-btn').click();
-	document.getElementById('generate-password').click();
-	await flush(10);
-
-	expect(document.getElementById('entry-password').value).toBe('TestPassword123!');
+    await createVault();
+    await addEntry({ site: 'example.com', username: 'user@example.com', password: 'pw1234' });
+    expect(siteNames()).toEqual(['example.com']);
+
+    cards()[0].querySelector('.edit-btn').click();
+    setVal('entry-site', 'changed.com');
+    submit('entry-form');
+    await tick();
+    expect(siteNames()).toEqual(['changed.com']);
+
+    document.querySelector('.delete-btn').click();
+    submit('delete-form');
+    await tick();
+    expect(cards().length).toBe(0);
   });
 
   test('deleting an entry requires confirmation via the delete modal', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+    await createVault();
+    await addEntry();
 
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'example.com';
-	document.getElementById('entry-password').value = 'pw';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+    document.querySelector('.delete-btn').click();
+    $('delete-cancel').click();
+    expect(cards().length).toBe(1);
 
-	document.querySelector('.delete-btn').click();
-	await flush(10);
-
-	// Cancel should leave the entry in place
-	document.getElementById('delete-cancel').click();
-	await flush(10);
-	expect(document.querySelectorAll('.entry-card').length).toBe(1);
-
-	// Now actually confirm the delete
-	document.querySelector('.delete-btn').click();
-	await flush(10);
-	document.getElementById('delete-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-	expect(document.querySelectorAll('.entry-card').length).toBe(0);
+    document.querySelector('.delete-btn').click();
+    submit('delete-form');
+    await tick();
+    expect(cards().length).toBe(0);
   });
 
-  test('CSV export via the warning modal downloads a text/csv file', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+  test('adding an entry with no site or password shows validation errors', async () => {
+    await createVault();
 
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'example.com';
-	document.getElementById('entry-password').value = 'pw';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+    await addEntry({ site: '', password: 'somepassword' });
+    expect($('entry-error').classList.contains('hidden')).toBe(false);
+    expect($('entry-error').textContent).toMatch(/Site \/ service name is required/);
+    expect(cards().length).toBe(0);
 
-	document.getElementById('export-csv-btn').click();
-	await flush(10);
-	expect(document.getElementById('export-csv-warning-modal').hasAttribute('open')).toBe(true);
-
-	document.getElementById('confirm-export-csv').click();
-	await flush(50);
-
-	expect(global.URL.createObjectURL).toHaveBeenCalled();
-	const blobArg = global.URL.createObjectURL.mock.calls[global.URL.createObjectURL.mock.calls.length - 1][0];
-	expect(blobArg.type).toBe('text/csv');
+    setVal('entry-site', 'example.com');
+    setVal('entry-password', '');
+    submit('entry-form');
+    await tick();
+    expect($('entry-error').textContent).toMatch(/Password is required/);
+    expect(cards().length).toBe(0);
   });
 
-  test('CSV export does NOT clear the unsaved-changes banner, only an encrypted backup export does', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+  test('the entry form rejects a password containing a comma', async () => {
+    await createVault();
+    await addEntry({ password: 'pass,word' });
+    expect($('entry-error').classList.contains('hidden')).toBe(false);
+    expect($('entry-error').textContent).toMatch(/Password cannot contain a comma/);
+    expect(cards().length).toBe(0);
 
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'example.com';
-	document.getElementById('entry-password').value = 'pw';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(false);
-
-	// CSV is a lossy, unencrypted side-export — not a real backup — so it
-	// must leave the "unsaved" state (and banner) exactly as it was.
-	document.getElementById('export-csv-btn').click();
-	await flush(10);
-	document.getElementById('confirm-export-csv').click();
-	await flush(50);
-
-	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(false);
-	expect(window.Vault.state.hasExported).toBe(false);
-
-	// The encrypted ".vault" backup IS the real persisted representation of
-	// the vault, so exporting it is what should actually clear the banner.
-	document.getElementById('export-btn').click();
-	await flush(10);
-	document.getElementById('export-filename').value = 'test-backup';
-	document.querySelector('#export-form button[type="submit"]').click();
-	await flush(50);
-
-	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(true);
-	expect(window.Vault.state.hasExported).toBe(true);
+    setVal('entry-password', 'passwordok');
+    submit('entry-form');
+    await tick();
+    expect(cards().length).toBe(1);
   });
 
-  test('CSV import chevron opens the hidden file input directly (no modal, no password)', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+  test('the entry form rejects leading/trailing space/tab passwords, for add and edit', async () => {
+    await createVault();
 
-	const fileInput = document.getElementById('merge-csv-file');
-	const clickSpy = jest.spyOn(fileInput, 'click');
+    for (const bad of [' leadingspace', 'trailingtab\t']) {
+      await addEntry({ password: bad });
+      expect($('entry-error').classList.contains('hidden')).toBe(false);
+      expect($('entry-error').textContent).toMatch(/cannot start or end with a space or tab/);
+      expect(cards().length).toBe(0);
+    }
 
-	document.getElementById('merge-csv-btn').click();
+    setVal('entry-password', 'valid password'); // internal space is fine
+    submit('entry-form');
+    await tick();
+    expect(cards().length).toBe(1);
 
-	expect(clickSpy).toHaveBeenCalledTimes(1);
-	// no modal should have opened for the CSV path
-	expect(document.getElementById('merge-modal').hasAttribute('open')).toBe(false);
+    document.querySelector('.edit-btn').click();
+    setVal('entry-password', '  bad-edit  ');
+    submit('entry-form');
+    await tick();
+    expect($('entry-error').textContent).toMatch(/cannot start or end with a space or tab/);
+    expect(window.Vault.state.entries[0].password).toBe('valid password');
   });
 
-  test('importing a CSV file adds valid rows as new entries and skips invalid ones', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+  // ---- Lock / unlock ------------------------------------------------------
+  test('re-unlocking with the wrong password shows an error and stays locked', async () => {
+    await createVault();
+    $('lock-btn').click();
+    expect(isActive('unlock-screen')).toBe(true);
 
-	const csvContent = [
-	  'site,username,password,notes',
-	  'a.com,u1,p1,n1',
-	  'b.com,u2,p2,',
-	  ',missing-site,p3,', // invalid: no site
-	  'c.com,u4', // invalid: wrong column count
-	].join('\n');
-	const csvFile = new File([csvContent], 'export.csv', { type: 'text/csv' });
+    window.VaultCrypto.unlockSession = async () => { throw new Error('Incorrect master password.'); };
+    setVal('master-password', 'wrong-password');
+    submit('unlock-form');
+    await tick();
 
-	const fileInput = document.getElementById('merge-csv-file');
-	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
-	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-	await flush(50);
-
-	const cards = document.querySelectorAll('.entry-card');
-	expect(cards.length).toBe(2);
-	const sites = Array.from(cards).map((c) => c.querySelector('.entry-site').textContent.trim());
-	expect(sites).toEqual(expect.arrayContaining(['a.com', 'b.com']));
-
-	const toastText = await waitForToastText(/2 added, 2 invalid skipped/);
-	expect(toastText).toMatch(/CSV import complete: 2 added, 2 invalid skipped\./);
-
-	// unsaved changes were introduced by the import
-	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(false);
-
-	// the file input is reset so the same file can be re-selected
-	expect(fileInput.value).toBe('');
+    expect($('unlock-error').classList.contains('hidden')).toBe(false);
+    expect($('unlock-error').textContent).toMatch(/Incorrect master password/);
+    expect(isActive('unlock-screen')).toBe(true);
+    expect(isActive('vault-screen')).toBe(false);
   });
 
-  test('CSV import skips an exact duplicate (all four fields match an existing entry)', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+  test('re-unlocking with the correct password returns to the vault screen', async () => {
+    await createVault();
+    $('lock-btn').click();
+    setVal('master-password', 'abcd');
+    submit('unlock-form');
+    await tick();
 
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'dup.com';
-	document.getElementById('entry-username').value = 'u';
-	document.getElementById('entry-password').value = 'same-pw';
-	document.getElementById('entry-notes').value = 'same note';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	expect(document.querySelectorAll('.entry-card').length).toBe(1);
-
-	// exact same site, username, password, and notes as the existing entry
-	const csvFile = new File(['dup.com,u,same-pw,same note'], 'export.csv', { type: 'text/csv' });
-	const fileInput = document.getElementById('merge-csv-file');
-	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
-	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-	await flush(50);
-
-	// nothing new was added — still just the one entry
-	expect(document.querySelectorAll('.entry-card').length).toBe(1);
-
-	const toastText = await waitForToastText(/1 duplicate skipped/);
-	expect(toastText).toMatch(/CSV import complete: 1 duplicate skipped\./);
+    expect(isActive('vault-screen')).toBe(true);
+    expect(isActive('unlock-screen')).toBe(false);
   });
 
-  test('CSV import skips (and warns about) a row that differs only in password, keeping the existing password', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+  // ---- Search / sort ------------------------------------------------------
+  test('search filters the entry list and sort re-orders it', async () => {
+    await createVault();
+    for (const site of ['zebra.com', 'apple.com', 'mango.com']) await addEntry({ site });
+    expect(cards().length).toBe(3);
 
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'dup.com';
-	document.getElementById('entry-username').value = 'u';
-	document.getElementById('entry-password').value = 'existing-pw';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+    const search = $('search-input');
+    search.value = 'apple';
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(siteNames()).toEqual(['apple.com']);
 
-	expect(document.querySelectorAll('.entry-card').length).toBe(1);
+    search.value = '';
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(siteNames()).toEqual(['apple.com', 'mango.com', 'zebra.com']);
 
-	// same site, username, and (empty) notes, but a different password
-	const csvFile = new File(['dup.com,u,new-pw,'], 'export.csv', { type: 'text/csv' });
-	const fileInput = document.getElementById('merge-csv-file');
-	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
-	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-	await flush(50);
-
-	// no conflict modal, and no new entry — the row is skipped, not merged or appended
-	expect(document.getElementById('conflict-modal').hasAttribute('open')).toBe(false);
-	const cards = document.querySelectorAll('.entry-card');
-	expect(cards.length).toBe(1);
-	expect(window.Vault.findEntry(cards[0].dataset.id).password).toBe('existing-pw');
-
-	const summaryToast = await waitForToastText(/1 skipped \(password differs\)/);
-	expect(summaryToast).toMatch(/CSV import complete: 1 skipped \(password differs\)\./);
-
-	const warningToast = await waitForToastText(/Password mismatch entries not imported/);
-	expect(warningToast).toMatch(/Password mismatch entries not imported: dup\.com\./);
+    $('sort-select').value = 'site-desc';
+    $('sort-select').dispatchEvent(new Event('change', { bubbles: true }));
+    expect(siteNames()).toEqual(['zebra.com', 'mango.com', 'apple.com']);
   });
 
-  test('the entry form rejects a password containing a comma and does not add the entry', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+  test('search with no matches shows the "no entries match" empty state', async () => {
+    await createVault();
+    await addEntry();
 
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'example.com';
-	document.getElementById('entry-password').value = 'pass,word';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+    $('search-input').value = 'zzz-no-match';
+    $('search-input').dispatchEvent(new Event('input', { bubbles: true }));
 
-	const error = document.getElementById('entry-error');
-	expect(error.classList.contains('hidden')).toBe(false);
-	expect(error.textContent).toMatch(/Password cannot contain a comma/);
-	expect(document.querySelectorAll('.entry-card').length).toBe(0);
-
-	// fixing the password (no comma) lets the same submit succeed
-	document.getElementById('entry-password').value = 'passwordok';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	expect(document.querySelectorAll('.entry-card').length).toBe(1);
+    expect(cards().length).toBe(0);
+    expect(isHidden('empty-state')).toBe(false);
+    expect($('empty-state').textContent).toMatch(/No entries match your search/);
   });
 
-  test('the entry form rejects a password with leading or trailing space/tab, for both add and edit', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+  // ---- Reveal / clipboard / generator ------------------------------------
+  test('reveal button toggles a password between masked and plaintext', async () => {
+    await createVault();
+    await addEntry({ password: 'super-secret' });
 
-	// leading space
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'example.com';
-	document.getElementById('entry-password').value = ' leadingspace';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+    const btn = document.querySelector('.reveal-btn');
+    const span = document.querySelector('.entry-password');
 
-	let error = document.getElementById('entry-error');
-	expect(error.classList.contains('hidden')).toBe(false);
-	expect(error.textContent).toMatch(/cannot start or end with a space or tab/);
-	expect(document.querySelectorAll('.entry-card').length).toBe(0);
+    expect(span.classList.contains('masked')).toBe(true);
+    btn.click();
+    expect(span.classList.contains('masked')).toBe(false);
+    expect(span.textContent).toBe('super-secret');
 
-	// trailing tab
-	document.getElementById('entry-password').value = 'trailingtab\t';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	error = document.getElementById('entry-error');
-	expect(error.classList.contains('hidden')).toBe(false);
-	expect(error.textContent).toMatch(/cannot start or end with a space or tab/);
-	expect(document.querySelectorAll('.entry-card').length).toBe(0);
-
-	// a valid password (no leading/trailing space/tab, internal space is fine) succeeds
-	document.getElementById('entry-password').value = 'valid password';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-	expect(document.querySelectorAll('.entry-card').length).toBe(1);
-
-	// editing to a leading/trailing-space password is rejected the same way
-	document.querySelector('.edit-btn').click();
-	await flush(10);
-	document.getElementById('entry-password').value = '  bad-edit  ';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	error = document.getElementById('entry-error');
-	expect(error.classList.contains('hidden')).toBe(false);
-	expect(error.textContent).toMatch(/cannot start or end with a space or tab/);
-	// the entry is unchanged
-	expect(window.Vault.state.entries[0].password).toBe('valid password');
+    btn.click();
+    expect(span.classList.contains('masked')).toBe(true);
+    expect(span.textContent).toBe('••••••••');
   });
 
-  test('CSV import trims leading/trailing whitespace from the password field instead of rejecting the row', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+  test('copy-password button writes to the clipboard and shows a success toast', async () => {
+    const writeText = jest.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
 
-	const csvContent = 'a.com,u1,  padded-pw  ,n1\nb.com,u2,\t\t,n2';
-	const csvFile = new File([csvContent], 'export.csv', { type: 'text/csv' });
-	const fileInput = document.getElementById('merge-csv-file');
-	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
-	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-	await flush(50);
+    await createVault();
+    await addEntry({ password: 'copy-me' });
 
-	// a.com's password is trimmed and imported; b.com is all-whitespace so it's invalid
-	const cards = document.querySelectorAll('.entry-card');
-	expect(cards.length).toBe(1);
-	expect(window.Vault.findEntry(cards[0].dataset.id).password).toBe('padded-pw');
+    document.querySelector('.copy-btn').click();
+    await tick();
 
-	const toastText = await waitForToastText(/1 added, 1 invalid skipped/);
-	expect(toastText).toMatch(/CSV import complete: 1 added, 1 invalid skipped\./);
+    expect(writeText).toHaveBeenCalledWith('copy-me');
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expectToast(/Password copied to clipboard/, 'success');
   });
 
-  test('CSV import skips a row whose (quoted) password contains a comma, counting it as invalid', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+  test('rapid clipboard copies share a single clear timer keyed to the most recent copy', async () => {
+    const writeText = jest.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
 
-	const csvContent = 'a.com,u1,"pass,word",n1\nb.com,u2,okpw,n2';
-	const csvFile = new File([csvContent], 'export.csv', { type: 'text/csv' });
-	const fileInput = document.getElementById('merge-csv-file');
-	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
-	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-	await flush(50);
+    await createVault();
+    await addEntry({ username: 'user@example.com', password: 'pw-secret' });
+    const card = document.querySelector('.entry-card');
 
-	const cards = document.querySelectorAll('.entry-card');
-	expect(cards.length).toBe(1);
-	expect(cards[0].querySelector('.entry-site').textContent).toContain('b.com');
+    jest.useFakeTimers();
+    const flushMicro = async () => { for (let i = 0; i < 3; i++) await Promise.resolve(); };
 
-	const toastText = await waitForToastText(/1 added, 1 invalid skipped/);
-	expect(toastText).toMatch(/CSV import complete: 1 added, 1 invalid skipped\./);
+    card.querySelector('.copy-btn').click(); // T+0
+    await flushMicro();
+
+    jest.advanceTimersByTime(5000);
+    card.querySelector('.copy-user-btn').click(); // T+5s
+    await flushMicro();
+
+    expect(writeText).toHaveBeenCalledWith('pw-secret');
+    expect(writeText).toHaveBeenCalledWith('user@example.com');
+
+    // T+15s: a per-copy timer for the password would already have cleared.
+    jest.advanceTimersByTime(10000);
+    await flushMicro();
+    expect(writeText).not.toHaveBeenCalledWith('');
+
+    // T+20s: 15s after the most recent copy, cleared exactly once.
+    jest.advanceTimersByTime(5000);
+    await flushMicro();
+    expect(writeText.mock.calls.filter((c) => c[0] === '')).toHaveLength(1);
   });
 
-  test('CSV import round-trips a notes field containing a comma', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	const csvContent = 'a.com,u1,pw1,"call center, ext. 204"';
-	const csvFile = new File([csvContent], 'export.csv', { type: 'text/csv' });
-	const fileInput = document.getElementById('merge-csv-file');
-	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
-	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-	await flush(50);
-
-	const cards = document.querySelectorAll('.entry-card');
-	expect(cards.length).toBe(1);
-	expect(cards[0].querySelector('.entry-notes').textContent).toBe('call center, ext. 204');
+  test('generate-password button fills in the entry password field', async () => {
+    await createVault();
+    $('add-btn').click();
+    $('generate-password').click();
+    expect($('entry-password').value).toBe('TestPassword123!');
   });
 
-  test('CSV import lists up to 3 sites for password mismatches and summarizes the rest', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
+  // ---- Unsaved banner & backup export ------------------------------------
+  test('the unsaved-changes banner is separate from the toast queue and cleared by a backup export', async () => {
+    await createVault();
+    expect(isHidden('unsaved-banner')).toBe(true);
 
-	// Seed pre-existing entries directly (bypassing the add-entry UI/toasts)
-	// so this test isn't stuck waiting through 4 sequential "Entry added."
-	// toasts before the import's own toasts can appear.
-	['one.com', 'two.com', 'three.com', 'four.com'].forEach((site, i) => {
-	  window.Vault.addEntry({ site, username: 'u', password: `pw${i + 1}`, notes: '' });
-	});
+    for (const site of ['a.com', 'b.com', 'c.com']) await addEntry({ site });
 
-	const csvContent = [
-	  'one.com,u,new1,',
-	  'two.com,u,new2,',
-	  'three.com,u,new3,',
-	  'four.com,u,new4,',
-	].join('\n');
-	const csvFile = new File([csvContent], 'export.csv', { type: 'text/csv' });
-	const fileInput = document.getElementById('merge-csv-file');
-	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
-	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-	await flush(50);
-	
-	const warningToast = await waitForToastText(/Password mismatch entries not imported/);
-	expect(warningToast).toMatch(/one\.com, two\.com, three\.com, and 1 more/);
+    expect(isHidden('unsaved-banner')).toBe(false);
+    expect($('unsaved-banner').textContent).toMatch(/Unsaved changes/);
+    // Regression: the unsaved notice used to be a persistent *toast* that piled
+    // up in the queue and blocked every "Entry added." behind it. Here we check
+    // all three were issued; the DOM-level delivery check is in
+    // 'toast queue integration' below.
+    expect(toasts.filter((t) => /Entry added\./.test(t.msg))).toHaveLength(3);
+
+    await exportBackup();
+    expect(isHidden('unsaved-banner')).toBe(true);
   });
 
-  test('re-importing a previously exported CSV of the current entries adds nothing (all exact duplicates)', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	document.getElementById('add-btn').click();
-	document.getElementById('entry-site').value = 'round-trip.com';
-	document.getElementById('entry-username').value = 'u';
-	document.getElementById('entry-password').value = 'pw';
-	document.getElementById('entry-notes').value = 'n';
-	document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	const exportedCsv = window.Storage.buildCsvContent(window.Vault.state.entries);
-	const csvFile = new File([exportedCsv], 're-import.csv', { type: 'text/csv' });
-	const fileInput = document.getElementById('merge-csv-file');
-	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
-	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-	await flush(50);
-
-	expect(document.querySelectorAll('.entry-card').length).toBe(1);
-	const toastText = await waitForToastText(/1 duplicate skipped/);
-	expect(toastText).toMatch(/CSV import complete: 1 duplicate skipped\./);
-  });
-
-  test('importing an all-invalid CSV adds nothing and reports the skip count without marking unsaved', async () => {
-	document.getElementById('create-vault-btn').click();
-	document.getElementById('create-password').value = 'abcd';
-	document.getElementById('create-password-confirm').value = 'abcd';
-	document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	await flush(20);
-
-	const csvFile = new File([',no-site,,'], 'export.csv', { type: 'text/csv' });
-	const fileInput = document.getElementById('merge-csv-file');
-	Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
-	fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-	await flush(50);
-
-	expect(document.querySelectorAll('.entry-card').length).toBe(0);
-	const toastText = await waitForToastText(/1 invalid skipped/);
-	expect(toastText).toMatch(/CSV import complete: 1 invalid skipped\./);
-	expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(true);
+  test('export (download) creates a blob download', async () => {
+    await createVault();
+    await addEntry({ site: 'x.com', username: 'a@b', password: 'p' });
+    await exportBackup();
+    expect(global.URL.createObjectURL).toHaveBeenCalled();
   });
 
   test('export is blocked with an error toast when the vault was never unlocked', async () => {
-
-	// No vault created/unlocked yet — cryptoKey is null from app init, so no
-	// other toasts are queued ahead of this one.
-	document.getElementById('export-btn').click();
-	await flush(10);
-
-	const toastText = await waitForToastText(/Vault is locked\. Unlock to export\./, 2000);
-	expect(toastText).toMatch(/Vault is locked\. Unlock to export\./);
-	expect(document.getElementById('export-modal').hasAttribute('open')).toBe(false);
+    $('export-btn').click();
+    expectToast(/Vault is locked\. Unlock to export\./, 'error');
+    expect($('export-modal').hasAttribute('open')).toBe(false);
   });
 
   test('beforeunload still warns about unsaved changes while the vault is locked', async () => {
-	  document.getElementById('create-vault-btn').click();
-	  document.getElementById('create-password').value = 'abcd';
-	  document.getElementById('create-password-confirm').value = 'abcd';
-	  document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	  await flush(20);
+    await createVault();
+    await addEntry();
+    $('lock-btn').click();
 
-	  document.getElementById('add-btn').click();
-	  document.getElementById('entry-site').value = 'example.com';
-	  document.getElementById('entry-password').value = 'pw';
-	  document.getElementById('entry-form').dispatchEvent(new Event('submit', { bubbles: true }));
-	  await flush(20);
+    expect(window.Vault.state.unlocked).toBe(false);
+    expect(isHidden('unsaved-banner')).toBe(false);
 
-	  document.getElementById('lock-btn').click();
-	  await flush(10);
-	  expect(window.Vault.state.unlocked).toBe(false);
-	  expect(document.getElementById('unsaved-banner').classList.contains('hidden')).toBe(false);
-
-	  const evt = new Event('beforeunload', { cancelable: true });
-	  window.dispatchEvent(evt);
-	  expect(evt.defaultPrevented).toBe(true);
+    const evt = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(evt);
+    expect(evt.defaultPrevented).toBe(true);
   });
 
-    describe('toast durations and CSV skip warnings', () => {
-    async function createVaultViaUI() {
-      document.getElementById('create-vault-btn').click();
-      document.getElementById('create-password').value = 'abcd';
-      document.getElementById('create-password-confirm').value = 'abcd';
-      document.getElementById('create-form').dispatchEvent(new Event('submit', { bubbles: true }));
-      await flush(20);
+  // ---- CSV export ---------------------------------------------------------
+  test('CSV export via the warning modal downloads a text/csv file', async () => {
+    await createVault();
+    await addEntry();
+
+    $('export-csv-btn').click();
+    expect($('export-csv-warning-modal').hasAttribute('open')).toBe(true);
+    $('confirm-export-csv').click();
+    await waitFor(() => findToast(/CSV exported/));
+
+    const calls = global.URL.createObjectURL.mock.calls;
+    expect(calls[calls.length - 1][0].type).toBe('text/csv');
+  });
+
+  test('CSV export does NOT clear the unsaved banner; only an encrypted backup export does', async () => {
+    await createVault();
+    await addEntry();
+    expect(isHidden('unsaved-banner')).toBe(false);
+
+    await exportCsv();
+    expect(isHidden('unsaved-banner')).toBe(false);
+    expect(window.Vault.state.hasExported).toBe(false);
+
+    await exportBackup();
+    expect(isHidden('unsaved-banner')).toBe(true);
+    expect(window.Vault.state.hasExported).toBe(true);
+  });
+
+  // ---- Restore / merge ----------------------------------------------------
+  test('restore from backup imports entries', async () => {
+    const restored = [{ id: 'id-1', site: 'r.com', username: 'u', password: 'p' }];
+    // File.text()-based parsing is stubbed; the rest of the app flow is real.
+    window.Storage.parseBackupFile = async () => restored;
+
+    $('restore-btn').click();
+    setFile('restore-file', new File(['{}'], 'backup.vault', { type: 'application/json' }));
+    setVal('restore-password', 'abcd');
+    submit('restore-form');
+
+    await waitFor(() => cards().length > 0);
+    expect(siteNames()).toEqual(['r.com']);
+    expect(isActive('vault-screen')).toBe(true);
+  });
+
+  describe('merge with backup', () => {
+    beforeEach(async () => {
+      await createVault();
+      await addEntry({ site: 'merge.com', username: 'u', password: 'old' });
+    });
+
+    // File parsing/decryption is stubbed; the merge logic in app.js is real.
+    async function submitMerge(importedEntries) {
+      window.Storage.parseBackupFile = async () => importedEntries;
+      $('merge-btn').click();
+      setFile('merge-file', new File(['{}'], 'backup.vault', { type: 'application/json' }));
+      setVal('merge-password', 'abcd');
+      submit('merge-form');
     }
+    const conflicting = { id: 'imp-1', site: 'merge.com', username: 'u', password: 'newpw' };
 
-    async function importCsvText(csvContent) {
-      const csvFile = new File([csvContent], 'export.csv', { type: 'text/csv' });
-      const fileInput = document.getElementById('merge-csv-file');
-      Object.defineProperty(fileInput, 'files', { value: [csvFile], configurable: true });
-      fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-      await flush(50);
-    }
-
-    test('info and success toasts auto-dismiss after about 3 seconds', () => {
-      jest.useFakeTimers();
-      try {
-        const toast = document.getElementById('toast');
-        const isVisible = () => !toast.classList.contains('hidden');
-
-        window.UI.showToast('info message', 'info');
-        expect(isVisible()).toBe(true);
-        jest.advanceTimersByTime(2900);
-        expect(isVisible()).toBe(true);
-        jest.advanceTimersByTime(200);
-        expect(isVisible()).toBe(false);
-
-        // let the queue's 50ms "show next" timer drain before the next case
-        jest.advanceTimersByTime(100);
-
-        window.UI.showToast('success message', 'success');
-        expect(isVisible()).toBe(true);
-        jest.advanceTimersByTime(3100);
-        expect(isVisible()).toBe(false);
-      } finally {
-        jest.useRealTimers();
-      }
+    test('a same site/username entry with a different password opens the conflict modal', async () => {
+      await submitMerge([conflicting]);
+      expect(await waitFor(() => $('conflict-modal').hasAttribute('open'))).toBe(true);
+      expect(cards().length).toBe(1);
     });
 
-    test('warning toasts stay visible longer than 3 seconds (about 7s)', () => {
-      jest.useFakeTimers();
-      try {
-        const toast = document.getElementById('toast');
-        const isVisible = () => !toast.classList.contains('hidden');
+    test('cancelling the conflict modal leaves the existing entry untouched', async () => {
+      let seen;
+      window.UI.showConflictModal = async (conflicts) => { seen = conflicts; return null; };
 
-        window.UI.showToast('careful now', 'warning');
-        expect(isVisible()).toBe(true);
-        expect(toast.className).toContain('toast-warning');
+      await submitMerge([conflicting]);
+      await waitFor(() => findToast(/Merge cancelled/));
 
-        jest.advanceTimersByTime(3100);
-        expect(isVisible()).toBe(true); // an info toast would be gone by now
-
-        jest.advanceTimersByTime(3800); // 6.9s total
-        expect(isVisible()).toBe(true);
-
-        jest.advanceTimersByTime(300); // 7.2s total
-        expect(isVisible()).toBe(false);
-      } finally {
-        jest.useRealTimers();
-      }
+      expect(seen).toHaveLength(1);
+      expect(cards().length).toBe(1);
+      expect(window.Vault.state.entries[0].password).toBe('old');
     });
 
-    test('error toasts stay visible longer than warnings (about 8s)', () => {
-      jest.useFakeTimers();
-      try {
-        const toast = document.getElementById('toast');
-        const isVisible = () => !toast.classList.contains('hidden');
+    test('a non-conflicting entry is added and marks the vault unsaved', async () => {
+      await exportBackup(); // start from a saved state
+      expect(isHidden('unsaved-banner')).toBe(true);
 
-        window.UI.showToast('something failed', 'error');
-        expect(isVisible()).toBe(true);
-        expect(toast.className).toContain('toast-error');
+      await submitMerge([{ id: 'imp-2', site: 'new.com', username: 'x', password: 'p' }]);
+      await waitFor(() => findToast(/Merge complete/));
 
-        jest.advanceTimersByTime(7100);
-        expect(isVisible()).toBe(true); // a warning toast would be gone by now
+      expectToast(/^Merge complete: 1 added\.$/, 'success');
+      expect(siteNames()).toEqual(['merge.com', 'new.com']);
+      expect(isHidden('unsaved-banner')).toBe(false);
+      expect($('merge-modal').hasAttribute('open')).toBe(false);
+    });
+  });
 
-        jest.advanceTimersByTime(1000); // 8.1s total
-        expect(isVisible()).toBe(false);
-      } finally {
-        jest.useRealTimers();
-      }
+  // ---- CSV import ---------------------------------------------------------
+  describe('CSV import', () => {
+    beforeEach(() => createVault());
+
+    // Seed directly (skips UI + its toasts).
+    const seed = (...entries) => entries.forEach((e) => window.Vault.addEntry({ username: 'u', notes: '', ...e }));
+
+    test('chevron opens the hidden file input directly (no modal, no password)', () => {
+      const clickSpy = jest.spyOn($('merge-csv-file'), 'click');
+      $('merge-csv-btn').click();
+      expect(clickSpy).toHaveBeenCalledTimes(1);
+      expect($('merge-modal').hasAttribute('open')).toBe(false);
     });
 
-    test('an unknown toast type falls back to the 3 second default', () => {
+    test('adds valid rows as new entries and skips invalid ones', async () => {
+      await importCsvText([
+        'site,username,password,notes',
+        'a.com,u1,p1,n1',
+        'b.com,u2,p2,',
+        ',missing-site,p3,', // invalid: no site
+        'c.com,u4',          // invalid: wrong column count
+      ].join('\n'));
+
+      expect(siteNames()).toEqual(expect.arrayContaining(['a.com', 'b.com']));
+      expect(cards().length).toBe(2);
+      expectToast(/^CSV import complete: 2 added, 2 invalid skipped\.$/);
+      expect(isHidden('unsaved-banner')).toBe(false);
+      expect($('merge-csv-file').value).toBe(''); // reset so the same file can be re-picked
+    });
+
+    test('skips an exact duplicate', async () => {
+      await addEntry({ site: 'dup.com', username: 'u', password: 'same-pw', notes: 'same note' });
+      await importCsvText('dup.com,u,same-pw,same note');
+
+      expect(cards().length).toBe(1);
+      expectToast(/^CSV import complete: 1 duplicate skipped\.$/);
+    });
+
+    test('skips (and warns about) a password-only difference, keeping the existing password', async () => {
+      await addEntry({ site: 'dup.com', username: 'u', password: 'existing-pw' });
+      await importCsvText('dup.com,u,new-pw,');
+
+      expect($('conflict-modal').hasAttribute('open')).toBe(false);
+      expect(cards().length).toBe(1);
+      expect(window.Vault.findEntry(cards()[0].dataset.id).password).toBe('existing-pw');
+      expectToast(/^CSV import complete: 1 skipped \(password differs\)\.$/);
+      expectToast(/^Password mismatch entries not imported: dup\.com\.$/, 'warning');
+    });
+
+    test('trims whitespace around the password instead of rejecting the row', async () => {
+      await importCsvText('a.com,u1,  padded-pw  ,n1\nb.com,u2,\t\t,n2');
+
+      expect(cards().length).toBe(1); // b.com is all-whitespace => invalid
+      expect(window.Vault.findEntry(cards()[0].dataset.id).password).toBe('padded-pw');
+      expectToast(/^CSV import complete: 1 added, 1 invalid skipped\.$/);
+    });
+
+    test('skips a row whose quoted password contains a comma as invalid', async () => {
+      await importCsvText('a.com,u1,"pass,word",n1\nb.com,u2,okpw,n2');
+
+      expect(siteNames()).toEqual(['b.com']);
+      expectToast(/^CSV import complete: 1 added, 1 invalid skipped\.$/);
+    });
+
+    test('round-trips a notes field containing a comma', async () => {
+      await importCsvText('a.com,u1,pw1,"call center, ext. 204"');
+
+      expect(cards().length).toBe(1);
+      expect(cards()[0].querySelector('.entry-notes').textContent).toBe('call center, ext. 204');
+    });
+
+    test('lists up to 3 mismatched sites and summarizes the rest', async () => {
+      seed(
+        { site: 'one.com', password: 'pw1' }, { site: 'two.com', password: 'pw2' },
+        { site: 'three.com', password: 'pw3' }, { site: 'four.com', password: 'pw4' },
+      );
+      await importCsvText('one.com,u,new1,\ntwo.com,u,new2,\nthree.com,u,new3,\nfour.com,u,new4,');
+
+      expectToast(/one\.com, two\.com, three\.com, and 1 more/, 'warning');
+    });
+
+    test('re-importing a previously exported CSV adds nothing (all exact duplicates)', async () => {
+      await addEntry({ site: 'round-trip.com', username: 'u', password: 'pw', notes: 'n' });
+      await importCsvText(window.Storage.buildCsvContent(window.Vault.state.entries));
+
+      expect(cards().length).toBe(1);
+      expectToast(/^CSV import complete: 1 duplicate skipped\.$/);
+    });
+
+    test('an all-invalid CSV adds nothing and does not mark unsaved', async () => {
+      await importCsvText(',no-site,,');
+
+      expect(cards().length).toBe(0);
+      expectToast(/^CSV import complete: 1 invalid skipped\.$/);
+      expect(isHidden('unsaved-banner')).toBe(true);
+    });
+
+    describe('skip warnings', () => {
+      test('invalid row', async () => {
+        await importCsvText('a.com,u1,p1,n1\n,no-site,pw,');
+        expectToast(/^Skipped 1 invalid row during CSV import\.$/, 'warning');
+        expect(cards().length).toBe(1);
+      });
+
+      test('exact duplicate', async () => {
+        seed({ site: 'dup.com', password: 'same-pw', notes: 'n' });
+        await importCsvText('dup.com,u,same-pw,n');
+        expectToast(/^Skipped 1 duplicate during CSV import\.$/, 'warning');
+      });
+
+      test('duplicates and invalid rows combine with correct pluralization', async () => {
+        seed({ site: 'one.com', password: 'pw1' }, { site: 'two.com', password: 'pw2' });
+        await importCsvText([
+          'one.com,u,pw1,', 'two.com,u,pw2,', // exact duplicates
+          ',no-site,pw,', 'bad.com,u,',       // invalid
+          'new.com,u,pw3,',                   // added
+        ].join('\n'));
+
+        expectToast(/^Skipped 2 duplicates and 2 invalid rows during CSV import\.$/, 'warning');
+        expect(cards().length).toBe(3);
+      });
+
+      test('no skip warning when every row is imported', async () => {
+        await importCsvText('a.com,u1,p1,n1\nb.com,u2,p2,n2');
+        expectToast(/^CSV import complete: 2 added\.$/);
+        expect(toasts.some((t) => t.type === 'warning')).toBe(false);
+      });
+
+      test('a password mismatch is not repeated in the generic skip warning', async () => {
+        seed({ site: 'mismatch.com', password: 'old-pw' }, { site: 'dup.com', password: 'same-pw' });
+        await importCsvText('mismatch.com,u,new-pw,\ndup.com,u,same-pw,');
+
+        expectToast(/Password mismatch entries not imported.*mismatch\.com/);
+        const generic = expectToast(/^Skipped 1 duplicate during CSV import\.$/);
+        expect(generic).not.toMatch(/mismatch/);
+      });
+    });
+  });
+
+  // ---- Toast queue integration (app.js -> real UI toast DOM) -------------
+  describe('toast queue integration', () => {
+    test('every toast is delivered in order while the unsaved banner is up', async () => {
+      useFakeTimers();
+      await createVault();
+      for (const site of ['a.com', 'b.com', 'c.com']) await addEntry({ site });
+      expect(isHidden('unsaved-banner')).toBe(false);
+
+      const shown = drainToasts();
+
+      expect(shown).toEqual(toasts.map((t) => t.msg));
+      expect(shown.filter((m) => /Entry added\./.test(m))).toHaveLength(3);
+      expect(isHidden('toast')).toBe(true);            // queue fully drained, nothing stuck
+      expect(isHidden('unsaved-banner')).toBe(false);  // banner persists independently
+    });
+
+    test('the "copied to clipboard" toast surfaces despite the unsaved banner, and the clipboard is cleared', async () => {
+      const writeText = jest.fn().mockResolvedValue(undefined);
+      Object.assign(navigator, { clipboard: { writeText } });
+
+      useFakeTimers();
+      await createVault();
+      await addEntry({ password: 'copy-me' });
+      document.querySelector('.copy-btn').click();
+      await tick();
+
+      const shown = drainToasts();
+
+      expect(shown).toContain('Password copied to clipboard.');
+      expect(writeText).toHaveBeenCalledWith('copy-me');
+      expect(writeText).toHaveBeenLastCalledWith(''); // 15s clear timer fired
+    });
+  });
+
+  // ---- Toast durations (real UI toast queue, fake timers) ----------------
+  describe('toast durations', () => {
+    const visible = () => !$('toast').classList.contains('hidden');
+
+    test.each([
+      ['info', 3000],
+      ['success', 3000],
+      ['not-a-real-type', 3000], // unknown types fall back to the default
+      ['warning', 7000],
+      ['error', 8000],
+    ])('%s toast auto-dismisses after about %dms', (type, ms) => {
       jest.useFakeTimers();
-      try {
-        const toast = document.getElementById('toast');
-        window.UI.showToast('mystery type', 'not-a-real-type');
-        expect(toast.classList.contains('hidden')).toBe(false);
-        jest.advanceTimersByTime(3100);
-        expect(toast.classList.contains('hidden')).toBe(true);
-      } finally {
-        jest.useRealTimers();
+      window.UI.showToast('msg', type);
+      expect(visible()).toBe(true);
+      if (['warning', 'error', 'info', 'success'].includes(type)) {
+        expect($('toast').className).toContain(`toast-${type}`);
       }
+
+      jest.advanceTimersByTime(ms - 100);
+      expect(visible()).toBe(true);
+      jest.advanceTimersByTime(200);
+      expect(visible()).toBe(false);
     });
 
     test('a long-lived warning toast delays the next queued toast until it has finished', () => {
       jest.useFakeTimers();
-      try {
-        const toast = document.getElementById('toast');
+      window.UI.showToast('first: warning', 'warning');
+      window.UI.showToast('second: info', 'info');
 
-        window.UI.showToast('first: warning', 'warning');
-        window.UI.showToast('second: info', 'info');
+      jest.advanceTimersByTime(6900);
+      expect($('toast').textContent).toBe('first: warning');
 
-        expect(toast.textContent).toBe('first: warning');
-        jest.advanceTimersByTime(6900);
-        expect(toast.textContent).toBe('first: warning');
-
-        // warning dismisses at 7s; the next toast is shown 50ms later
-        jest.advanceTimersByTime(300);
-        expect(toast.textContent).toBe('second: info');
-        expect(toast.className).toContain('toast-info');
-      } finally {
-        jest.useRealTimers();
-      }
-    });
-
-    test('CSV import shows a warning toast when an invalid row is skipped', async () => {
-      await createVaultViaUI();
-
-      await importCsvText('a.com,u1,p1,n1\n,no-site,pw,');
-
-      const warning = await waitForToastText(/Skipped 1 invalid row during CSV import/);
-      expect(warning).toMatch(/Skipped 1 invalid row during CSV import\./);
-      expect(document.getElementById('toast').className).toContain('toast-warning');
-      expect(document.querySelectorAll('.entry-card').length).toBe(1);
-    });
-
-    test('CSV import shows a warning toast when an exact duplicate is skipped', async () => {
-      await createVaultViaUI();
-
-      // seed directly to avoid queueing an extra "Entry added." toast
-      window.Vault.addEntry({ site: 'dup.com', username: 'u', password: 'same-pw', notes: 'n' });
-
-      await importCsvText('dup.com,u,same-pw,n');
-
-      const warning = await waitForToastText(/Skipped 1 duplicate during CSV import/);
-      expect(warning).toMatch(/Skipped 1 duplicate during CSV import\./);
-      expect(document.getElementById('toast').className).toContain('toast-warning');
-    });
-
-    test('CSV import warning combines duplicates and invalid rows, with correct pluralization', async () => {
-      await createVaultViaUI();
-
-      window.Vault.addEntry({ site: 'one.com', username: 'u', password: 'pw1', notes: '' });
-      window.Vault.addEntry({ site: 'two.com', username: 'u', password: 'pw2', notes: '' });
-
-      await importCsvText([
-        'one.com,u,pw1,',        // exact duplicate
-        'two.com,u,pw2,',        // exact duplicate
-        ',no-site,pw,',          // invalid: missing site
-        'bad.com,u,',            // invalid: wrong column count
-        'new.com,u,pw3,',        // valid: added
-      ].join('\n'));
-
-      const warning = await waitForToastText(/Skipped 2 duplicates and 2 invalid rows during CSV import/);
-      expect(warning).toMatch(/Skipped 2 duplicates and 2 invalid rows during CSV import\./);
-      expect(document.getElementById('toast').className).toContain('toast-warning');
-      expect(document.querySelectorAll('.entry-card').length).toBe(3);
-    });
-
-    test('CSV import does not show a skip warning when every row is imported', async () => {
-      await createVaultViaUI();
-
-      await importCsvText('a.com,u1,p1,n1\nb.com,u2,p2,n2');
-
-      // wait for the summary toast, then confirm no warning follows it
-      await waitForToastText(/CSV import complete: 2 added\./);
-      await flush(3300); // let the summary toast expire and the queue drain
-
-      const toast = document.getElementById('toast');
-      expect(toast.className).not.toContain('toast-warning');
-      expect(toast.textContent).not.toMatch(/Skipped/);
-    });
-
-    test('a password mismatch warning is not repeated in the generic skip warning', async () => {
-      await createVaultViaUI();
-
-      window.Vault.addEntry({ site: 'mismatch.com', username: 'u', password: 'old-pw', notes: '' });
-      window.Vault.addEntry({ site: 'dup.com', username: 'u', password: 'same-pw', notes: '' });
-
-      await importCsvText([
-        'mismatch.com,u,new-pw,', // password differs -> dedicated mismatch warning
-        'dup.com,u,same-pw,',     // exact duplicate  -> generic skip warning
-      ].join('\n'));
-
-      // mismatch warning shows first (7s), then the generic skip warning
-      const mismatch = await waitForToastText(/Password mismatch entries not imported/);
-      expect(mismatch).toMatch(/mismatch\.com/);
-
-      const generic = await waitForToastText(/Skipped 1 duplicate during CSV import/);
-      expect(generic).toMatch(/^Skipped 1 duplicate during CSV import\.$/);
-      expect(generic).not.toMatch(/mismatch/);
+      jest.advanceTimersByTime(300); // dismiss at 7s, next shown 50ms later
+      expect($('toast').textContent).toBe('second: info');
+      expect($('toast').className).toContain('toast-info');
     });
   });
 });
